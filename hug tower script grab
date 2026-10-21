@@ -1,0 +1,234 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+local HugRequest = ReplicatedStorage
+    :WaitForChild("HugRemotes")
+    :WaitForChild("HugRequest")
+
+local selectedPlayer = nil
+
+-- GUI
+local gui = Instance.new("ScreenGui")
+gui.Name = "HugPlayerGui"
+gui.ResetOnSpawn = false
+gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local openButton = Instance.new("TextButton")
+openButton.Size = UDim2.fromOffset(110, 36)
+openButton.Position = UDim2.new(0, 16, 0.5, 0)
+openButton.Text = "Open Hug GUI"
+openButton.Visible = false
+openButton.Parent = gui
+
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(320, 400)
+main.Position = UDim2.new(0.5, -160, 0.5, -200)
+main.BackgroundColor3 = Color3.fromRGB(25, 27, 35)
+main.BorderSizePixel = 0
+main.Parent = gui
+
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 12)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -80, 0, 46)
+title.Position = UDim2.fromOffset(14, 0)
+title.BackgroundTransparency = 1
+title.Text = "  Hug Player"
+title.TextColor3 = Color3.new(1, 1, 1)
+title.TextSize = 18
+title.Font = Enum.Font.GothamBold
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = main
+
+local close = Instance.new("TextButton")
+close.Size = UDim2.fromOffset(36, 30)
+close.Position = UDim2.new(1, -44, 0, 8)
+close.Text = "×"
+close.TextSize = 22
+close.TextColor3 = Color3.new(1, 1, 1)
+close.BackgroundColor3 = Color3.fromRGB(190, 65, 75)
+close.Parent = main
+Instance.new("UICorner", close).CornerRadius = UDim.new(0, 8)
+
+local refresh = Instance.new("TextButton")
+refresh.Size = UDim2.new(1, -20, 0, 34)
+refresh.Position = UDim2.fromOffset(10, 50)
+refresh.Text = "Refresh Players"
+refresh.TextColor3 = Color3.new(1, 1, 1)
+refresh.BackgroundColor3 = Color3.fromRGB(60, 85, 145)
+refresh.Font = Enum.Font.GothamMedium
+refresh.TextSize = 13
+refresh.Parent = main
+Instance.new("UICorner", refresh).CornerRadius = UDim.new(0, 8)
+
+local list = Instance.new("ScrollingFrame")
+list.Size = UDim2.new(1, -20, 1, -98)
+list.Position = UDim2.fromOffset(10, 90)
+list.BackgroundColor3 = Color3.fromRGB(32, 34, 44)
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 4
+list.CanvasSize = UDim2.new()
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+list.Parent = main
+Instance.new("UICorner", list).CornerRadius = UDim.new(0, 8)
+
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, 6)
+layout.SortOrder = Enum.SortOrder.Name
+layout.Parent = list
+
+local padding = Instance.new("UIPadding")
+padding.PaddingTop = UDim.new(0, 7)
+padding.PaddingLeft = UDim.new(0, 7)
+padding.PaddingRight = UDim.new(0, 7)
+padding.Parent = list
+
+-- Smooth dragging
+local dragging = false
+local dragStart
+local startPosition
+local dragInput
+
+title.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPosition = main.Position
+
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+title.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and input == dragInput then
+        local delta = input.Position - dragStart
+        local target = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+
+        main.Position = main.Position:Lerp(target, 0.65)
+    end
+end)
+
+-- Close / reopen
+close.MouseButton1Click:Connect(function()
+    main.Visible = false
+    openButton.Visible = true
+end)
+
+openButton.MouseButton1Click:Connect(function()
+    main.Visible = true
+    openButton.Visible = false
+end)
+
+-- Player list with Roblox profile thumbnails
+local function refreshPlayers()
+    for _, child in ipairs(list:GetChildren()) do
+        if child:IsA("Frame") then
+            child:Destroy()
+        end
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local row = Instance.new("Frame")
+            row.Name = player.Name
+            row.Size = UDim2.new(1, -4, 0, 58)
+            row.BackgroundColor3 = Color3.fromRGB(43, 46, 59)
+            row.BorderSizePixel = 0
+            row.LayoutOrder = 0
+            row.Parent = list
+            Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+            local avatar = Instance.new("ImageLabel")
+            avatar.Size = UDim2.fromOffset(42, 42)
+            avatar.Position = UDim2.fromOffset(8, 8)
+            avatar.BackgroundColor3 = Color3.fromRGB(60, 62, 75)
+            avatar.Parent = row
+            Instance.new("UICorner", avatar).CornerRadius = UDim.new(1, 0)
+
+            task.spawn(function()
+                local ok, image = pcall(function()
+                    return Players:GetUserThumbnailAsync(
+                        player.UserId,
+                        Enum.ThumbnailType.HeadShot,
+                        Enum.ThumbnailSize.Size100x100
+                    )
+                end)
+
+                if ok and avatar.Parent then
+                    avatar.Image = image
+                end
+            end)
+
+            local display = Instance.new("TextLabel")
+            display.Size = UDim2.new(1, -125, 0, 24)
+            display.Position = UDim2.fromOffset(58, 5)
+            display.BackgroundTransparency = 1
+            display.Text = player.DisplayName
+            display.TextColor3 = Color3.new(1, 1, 1)
+            display.TextSize = 14
+            display.Font = Enum.Font.GothamBold
+            display.TextXAlignment = Enum.TextXAlignment.Left
+            display.TextTruncate = Enum.TextTruncate.AtEnd
+            display.Parent = row
+
+            local username = Instance.new("TextLabel")
+            username.Size = UDim2.new(1, -125, 0, 18)
+            username.Position = UDim2.fromOffset(58, 29)
+            username.BackgroundTransparency = 1
+            username.Text = "@" .. player.Name
+            username.TextColor3 = Color3.fromRGB(165, 170, 185)
+            username.TextSize = 11
+            username.Font = Enum.Font.Gotham
+            username.TextXAlignment = Enum.TextXAlignment.Left
+            username.Parent = row
+
+            local hug = Instance.new("TextButton")
+            hug.Size = UDim2.fromOffset(52, 32)
+            hug.Position = UDim2.new(1, -60, 0.5, -16)
+            hug.Text = "Hug"
+            hug.TextColor3 = Color3.new(1, 1, 1)
+            hug.TextSize = 12
+            hug.Font = Enum.Font.GothamBold
+            hug.BackgroundColor3 = Color3.fromRGB(100, 80, 210)
+            hug.Parent = row
+            Instance.new("UICorner", hug).CornerRadius = UDim.new(0, 8)
+
+            hug.MouseButton1Click:Connect(function()
+                if player.Parent ~= Players then
+                    return
+                end
+
+                local character = player.Character
+                if character then
+                    HugRequest:FireServer("tryGrab", character)
+                end
+            end)
+        end
+    end
+end
+
+refresh.MouseButton1Click:Connect(refreshPlayers)
+
+Players.PlayerAdded:Connect(refreshPlayers)
+Players.PlayerRemoving:Connect(refreshPlayers)
+
+refreshPlayers()
