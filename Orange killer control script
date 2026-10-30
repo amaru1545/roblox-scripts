@@ -605,3 +605,46 @@ end))
 --========================================================
 -- END OF SCRIPT
 --========================================================
+
+
+--// Screen Watermark
+--// Place inside StarterPlayer > StarterPlayerScripts
+
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "WatermarkGui"
+screenGui.ResetOnSpawn = false
+screenGui.IgnoreGuiInset = false
+screenGui.DisplayOrder = 10
+screenGui.Parent = player:WaitForChild("PlayerGui")
+
+local watermark = Instance.new("TextLabel")
+watermark.Name = "Watermark"
+watermark.Parent = screenGui
+
+-- Position: top-right corner
+watermark.AnchorPoint = Vector2.new(1, 0)
+watermark.Position = UDim2.new(1, -20, 0, 15)
+watermark.Size = UDim2.new(0, 280, 0, 55)
+
+-- Appearance
+watermark.BackgroundTransparency = 1
+watermark.BorderSizePixel = 0
+
+watermark.Text = "===Ptyvx Scripts!=="
+watermark.TextColor3 = Color3.fromRGB(255, 255, 255)
+watermark.TextTransparency = 0.35
+watermark.TextSize = 28
+watermark.Font = Enum.Font.GothamBold
+
+watermark.TextXAlignment = Enum.TextXAlignment.Right
+watermark.TextYAlignment = Enum.TextYAlignment.Center
+
+-- Keep the text readable on bright and dark backgrounds
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(0, 0, 0)
+stroke.Thickness = 1.5
+stroke.Transparency = 0.55
+stroke.Parent = watermark
