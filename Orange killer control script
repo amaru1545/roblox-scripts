@@ -1,0 +1,607 @@
+
+--========================================================
+-- ORANGE KILLER FOLLOW CONTROLLER
+-- LocalScript: StarterPlayer > StarterPlayerScripts
+--========================================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- SETTINGS
+local MODEL_NAME = "Orange Killer"
+local HITBOX_NAME = "AttackHitbox"
+
+local DEFAULT_GAP = 18
+local MIN_GAP = 2
+local MAX_GAP = 40
+
+local HEIGHT_OFFSET = -4
+local JUMP_HEIGHT = 17
+local JUMP_DURATION = 0.8
+local ORBIT_SPEED = 1.8
+
+local PLATFORM_SIZE = Vector3.new(7, 0.35, 7)
+local PLATFORM_TRANSPARENCY = 0.5
+
+-- STATE
+local enabled = false
+local closed = false
+local dragging = false
+
+local gap = DEFAULT_GAP
+local orbitAngle = 0
+local sideInput = 0
+local lockedHeight = nil
+
+local jumping = false
+local jumpEndsAt = 0
+
+local character
+local humanoid
+local root
+
+local originalCFrame
+local originalAutoRotate
+local originalCameraType
+local originalCameraSubject
+
+local platform
+local followConnection
+local connections = {}
+
+local dragStart
+local startPosition
+local dragInput
+
+local function track(connection)
+    table.insert(connections, connection)
+    return connection
+end
+
+--========================================================
+-- CHARACTER
+--========================================================
+
+local function setCharacter(char)
+    character = char
+    humanoid = char:WaitForChild("Humanoid")
+    root = char:WaitForChild("HumanoidRootPart")
+end
+
+if player.Character then
+    task.spawn(setCharacter, player.Character)
+end
+
+track(player.CharacterAdded:Connect(setCharacter))
+
+--========================================================
+-- FIND ORANGE KILLER
+--========================================================
+
+local function getOrangeModel()
+    return workspace:FindFirstChild(MODEL_NAME, true)
+end
+
+local function getHitbox()
+    local model = getOrangeModel()
+
+    if not model then
+        return nil
+    end
+
+    local hitbox = model:FindFirstChild(HITBOX_NAME, true)
+
+    if hitbox and hitbox:IsA("BasePart") then
+        return hitbox
+    end
+
+    return nil
+end
+
+--========================================================
+-- DETECT WHEN ORANGE IS GROUNDED
+--========================================================
+
+local function isOrangeStanding(model)
+    if not model then
+        return false
+    end
+
+    local orangeHumanoid =
+        model:FindFirstChildWhichIsA("Humanoid", true)
+
+    if orangeHumanoid then
+        local state = orangeHumanoid:GetState()
+
+        return orangeHumanoid.Health > 0
+            and orangeHumanoid.FloorMaterial ~= Enum.Material.Air
+            and state ~= Enum.HumanoidStateType.Jumping
+            and state ~= Enum.HumanoidStateType.Freefall
+            and state ~= Enum.HumanoidStateType.FallingDown
+            and state ~= Enum.HumanoidStateType.Ragdoll
+    end
+
+    -- Fallback for models without a Humanoid:
+    -- treat the hitbox as standing when its vertical velocity
+    -- stays near zero. This is only an approximation.
+    return false
+end
+
+--========================================================
+-- GUI
+--========================================================
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "OrangeFollowController"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 1000
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = playerGui
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(310, 255)
+main.Position = UDim2.new(0.5, -155, 0.5, -127)
+main.BackgroundColor3 = Color3.fromRGB(25, 26, 35)
+main.BorderSizePixel = 0
+main.Active = true
+main.Parent = gui
+
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 12)
+
+local outline = Instance.new("UIStroke")
+outline.Color = Color3.fromRGB(255, 135, 65)
+outline.Thickness = 1.5
+outline.Parent = main
+
+local function makeButton(parent, text, size, position, color)
+    local button = Instance.new("TextButton")
+    button.Size = size
+    button.Position = position
+    button.BackgroundColor3 = color
+    button.TextColor3 = Color3.new(1, 1, 1)
+    button.Text = text
+    button.Font = Enum.Font.GothamSemibold
+    button.TextSize = 13
+    button.BorderSizePixel = 0
+    button.Active = true
+    button.AutoButtonColor = true
+    button.ZIndex = 5
+    button.Parent = parent
+
+    Instance.new("UICorner", button).CornerRadius = UDim.new(0, 7)
+
+    return button
+end
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -100, 0, 38)
+title.Position = UDim2.fromOffset(13, 0)
+title.BackgroundTransparency = 1
+title.Text = "ORANGE KILLER"
+title.TextColor3 = Color3.fromRGB(255, 150, 85)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Active = true
+title.Parent = main
+
+local minimize = makeButton(
+    main, "—", UDim2.fromOffset(29, 27),
+    UDim2.new(1, -66, 0, 6),
+    Color3.fromRGB(60, 62, 76)
+)
+
+local close = makeButton(
+    main, "X", UDim2.fromOffset(29, 27),
+    UDim2.new(1, -33, 0, 6),
+    Color3.fromRGB(190, 55, 60)
+)
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -26, 0, 25)
+status.Position = UDim2.fromOffset(13, 39)
+status.BackgroundTransparency = 1
+status.Text = "Status: OFF"
+status.TextColor3 = Color3.fromRGB(220, 220, 230)
+status.Font = Enum.Font.Gotham
+status.TextSize = 12
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Parent = main
+
+local toggle = makeButton(
+    main, "ENABLE FOLLOW",
+    UDim2.new(1, -26, 0, 36),
+    UDim2.fromOffset(13, 67),
+    Color3.fromRGB(40, 145, 85)
+)
+
+local gapLabel = Instance.new("TextLabel")
+gapLabel.Size = UDim2.new(1, -26, 0, 20)
+gapLabel.Position = UDim2.fromOffset(13, 107)
+gapLabel.BackgroundTransparency = 1
+gapLabel.Text = "Gap: " .. gap .. " studs"
+gapLabel.TextColor3 = Color3.fromRGB(225, 225, 235)
+gapLabel.Font = Enum.Font.Gotham
+gapLabel.TextSize = 12
+gapLabel.Parent = main
+
+local minus = makeButton(
+    main, "-", UDim2.fromOffset(90, 29),
+    UDim2.fromOffset(13, 132),
+    Color3.fromRGB(65, 70, 90)
+)
+
+local plus = makeButton(
+    main, "+", UDim2.fromOffset(90, 29),
+    UDim2.new(1, -103, 0, 132),
+    Color3.fromRGB(65, 70, 90)
+)
+
+local help = Instance.new("TextLabel")
+help.Size = UDim2.new(1, -26, 0, 48)
+help.Position = UDim2.fromOffset(13, 174)
+help.BackgroundTransparency = 1
+help.Text = "A/D: orbit | Space: jump 17 studs\nJump duration: " ..
+    JUMP_DURATION .. " seconds"
+help.TextColor3 = Color3.fromRGB(185, 190, 205)
+help.Font = Enum.Font.Gotham
+help.TextSize = 11
+help.TextWrapped = true
+help.Parent = main
+
+local reopen = makeButton(
+    gui, "OPEN", UDim2.fromOffset(65, 36),
+    UDim2.new(0, 12, 0.5, -18),
+    Color3.fromRGB(255, 125, 60)
+)
+reopen.Visible = false
+
+--========================================================
+-- DRAG GUI
+--========================================================
+
+track(title.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPosition = main.Position
+    end
+end))
+
+track(title.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end))
+
+track(UserInputService.InputChanged:Connect(function(input)
+    if not dragging then
+        return
+    end
+
+    if input == dragInput
+        or input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - dragStart
+
+        main.Position = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+    end
+end))
+
+track(UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end))
+
+--========================================================
+-- GAP CONTROLS
+--========================================================
+
+track(minus.Activated:Connect(function()
+    gap = math.max(MIN_GAP, gap - 1)
+    gapLabel.Text = "Gap: " .. gap .. " studs"
+end))
+
+track(plus.Activated:Connect(function()
+    gap = math.min(MAX_GAP, gap + 1)
+    gapLabel.Text = "Gap: " .. gap .. " studs"
+end))
+
+--========================================================
+-- PLATFORM
+--========================================================
+
+local function destroyPlatform()
+    if platform then
+        platform:Destroy()
+        platform = nil
+    end
+end
+
+local function createPlatform()
+    destroyPlatform()
+
+    platform = Instance.new("Part")
+    platform.Name = "LocalFollowPlatform"
+    platform.Size = PLATFORM_SIZE
+    platform.Anchored = true
+    platform.CanCollide = true
+    platform.CanTouch = false
+    platform.CanQuery = false
+    platform.Transparency = PLATFORM_TRANSPARENCY
+    platform.Material = Enum.Material.SmoothPlastic
+    platform.Color = Color3.fromRGB(255, 145, 65)
+    platform.CastShadow = false
+    platform.Parent = workspace
+end
+
+--========================================================
+-- STOP FOLLOWING
+--========================================================
+
+local function stopFollowing()
+    enabled = false
+    sideInput = 0
+    jumping = false
+
+    if followConnection then
+        followConnection:Disconnect()
+        followConnection = nil
+    end
+
+    destroyPlatform()
+
+    if root and root.Parent and originalCFrame then
+        root.CFrame = originalCFrame
+        root.AssemblyLinearVelocity = Vector3.zero
+    end
+
+    local camera = workspace.CurrentCamera
+
+    if camera then
+        camera.CameraType = originalCameraType or Enum.CameraType.Custom
+
+        if humanoid and humanoid.Parent then
+            camera.CameraSubject = humanoid
+        elseif originalCameraSubject and originalCameraSubject.Parent then
+            camera.CameraSubject = originalCameraSubject
+        end
+    end
+
+    if humanoid and humanoid.Parent and originalAutoRotate ~= nil then
+        humanoid.AutoRotate = originalAutoRotate
+    end
+
+    originalCFrame = nil
+    originalAutoRotate = nil
+    originalCameraType = nil
+    originalCameraSubject = nil
+    lockedHeight = nil
+
+    toggle.Text = "ENABLE FOLLOW"
+    toggle.BackgroundColor3 = Color3.fromRGB(40, 145, 85)
+    status.Text = "Status: OFF"
+end
+
+--========================================================
+-- START FOLLOWING
+--========================================================
+
+local function startFollowing()
+    if not root or not root.Parent
+        or not humanoid or humanoid.Health <= 0 then
+        status.Text = "Status: CHARACTER NOT READY"
+        return
+    end
+
+    local hitbox = getHitbox()
+
+    if not hitbox then
+        status.Text = "Status: HITBOX NOT FOUND"
+        return
+    end
+
+    local camera = workspace.CurrentCamera
+
+    originalCFrame = root.CFrame
+    originalAutoRotate = humanoid.AutoRotate
+
+    if camera then
+        originalCameraType = camera.CameraType
+        originalCameraSubject = camera.CameraSubject
+        camera.CameraType = Enum.CameraType.Custom
+        camera.CameraSubject = humanoid
+    end
+
+    -- Initial reference is always the hitbox, not your position.
+    lockedHeight = hitbox.Position.Y + HEIGHT_OFFSET
+
+    humanoid.AutoRotate = false
+    orbitAngle = 0
+    sideInput = 0
+    jumping = false
+    enabled = true
+
+    createPlatform()
+
+    toggle.Text = "DISABLE FOLLOW"
+    toggle.BackgroundColor3 = Color3.fromRGB(170, 60, 60)
+    status.Text = "Status: FOLLOWING"
+
+    followConnection = RunService.Heartbeat:Connect(function()
+        if not enabled then
+            return
+        end
+
+        if not root or not root.Parent
+            or not humanoid or humanoid.Health <= 0 then
+            status.Text = "Status: CHARACTER UNAVAILABLE"
+            return
+        end
+
+        local currentHitbox = getHitbox()
+
+        if not currentHitbox then
+            status.Text = "Status: HITBOX NOT FOUND"
+            return
+        end
+
+        local orangeModel = getOrangeModel()
+
+        -- Update the locked height only when Orange is grounded.
+        -- While he jumps or ragdolls, preserve the last standing height.
+        if orangeModel and isOrangeStanding(orangeModel) then
+            lockedHeight = currentHitbox.Position.Y + HEIGHT_OFFSET
+        end
+
+        orbitAngle = orbitAngle + sideInput * ORBIT_SPEED * (1 / 60)
+
+        local center = currentHitbox.Position
+
+        local hitboxRadius = math.max(
+            currentHitbox.Size.X,
+            currentHitbox.Size.Z
+        ) * 0.5
+
+        local playerRadius = math.max(
+            root.Size.X,
+            root.Size.Z
+        ) * 0.5
+
+        local radius = hitboxRadius + playerRadius + gap
+
+        local offset = Vector3.new(
+            math.sin(orbitAngle) * radius,
+            0,
+            math.cos(orbitAngle) * radius
+        )
+
+        local targetY = lockedHeight
+
+        -- Hold the jump position for the full duration,
+        -- then snap straight back to the normal height.
+        if jumping then
+            if os.clock() >= jumpEndsAt then
+                jumping = false
+            else
+                targetY = lockedHeight + JUMP_HEIGHT
+            end
+        end
+
+        local targetPosition = Vector3.new(
+            center.X + offset.X,
+            targetY,
+            center.Z + offset.Z
+        )
+
+        root.CFrame = CFrame.new(targetPosition) * root.CFrame.Rotation
+        root.AssemblyLinearVelocity = Vector3.zero
+
+        -- Keep platform directly beneath the character.
+        local footY = root.Position.Y
+            - humanoid.HipHeight
+            - root.Size.Y * 0.5
+
+        if platform and platform.Parent then
+            platform.Position = Vector3.new(
+                root.Position.X,
+                footY - PLATFORM_SIZE.Y * 0.5 + 0.05,
+                root.Position.Z
+            )
+        end
+
+        status.Text = "Status: FOLLOWING | GAP " .. gap
+    end)
+end
+
+--========================================================
+-- KEYBOARD
+--========================================================
+
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed or not enabled then
+        return
+    end
+
+    if input.KeyCode == Enum.KeyCode.A
+        or input.KeyCode == Enum.KeyCode.Left then
+        sideInput = 1
+
+    elseif input.KeyCode == Enum.KeyCode.D
+        or input.KeyCode == Enum.KeyCode.Right then
+        sideInput = -1
+
+    elseif input.KeyCode == Enum.KeyCode.Space then
+        if not jumping and lockedHeight and root and root.Parent then
+            jumping = true
+            jumpEndsAt = os.clock() + JUMP_DURATION
+        end
+    end
+end))
+
+track(UserInputService.InputEnded:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.A
+        or input.KeyCode == Enum.KeyCode.Left
+        or input.KeyCode == Enum.KeyCode.D
+        or input.KeyCode == Enum.KeyCode.Right then
+        sideInput = 0
+    end
+end))
+
+--========================================================
+-- GUI BUTTONS
+--========================================================
+
+track(toggle.Activated:Connect(function()
+    if enabled then
+        stopFollowing()
+    else
+        startFollowing()
+    end
+end))
+
+track(minimize.Activated:Connect(function()
+    main.Visible = false
+    reopen.Visible = true
+end))
+
+track(reopen.Activated:Connect(function()
+    main.Visible = true
+    reopen.Visible = false
+end))
+
+track(close.Activated:Connect(function()
+    if closed then
+        return
+    end
+
+    stopFollowing()
+    closed = true
+
+    for _, connection in ipairs(connections) do
+        connection:Disconnect()
+    end
+
+    table.clear(connections)
+
+    if gui and gui.Parent then
+        gui:Destroy()
+    end
+end))
+
+--========================================================
+-- END OF SCRIPT
+--========================================================
