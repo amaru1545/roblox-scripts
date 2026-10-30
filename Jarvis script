@@ -1,0 +1,2342 @@
+--========================================================
+-- J.A.R.V.I.S. MARK INFINITY  v4  "BLACKOUT"
+-- Client-side Roblox exosuit (LocalScript)
+-- Place in StarterPlayer > StarterPlayerScripts
+--
+-- J       Suit on/off (armor flies in piece by piece)
+-- F       Flight on/off
+-- Space   Ascend            Ctrl  Descend
+-- V       Hold for boost (Shift is NOT used)
+-- Q       Hold to charge / release to fire repulsor
+-- R       Multi-lock missile barrage
+-- C       Hold: chest UNIBEAM
+-- G       Energy shield dome
+-- T       Orbital strike on your reticle
+-- E       Arc Reactor Overdrive
+-- H       HUD on/off        M  Mute        X  Emergency shutdown
+--
+-- Third-person first: body aims at the reticle, arms pose,
+-- aim ray ignores whatever sits between camera and character.
+-- Everything is local visuals/audio, no authoritative damage.
+--========================================================
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local Lighting = game:GetService("Lighting")
+local CollectionService = game:GetService("CollectionService")
+
+local Player = Players.LocalPlayer
+local PlayerGui = Player:WaitForChild("PlayerGui")
+
+--========================================================
+-- CONFIG
+--========================================================
+
+local C = {
+	Cyan = Color3.fromRGB(0, 220, 255),
+	Gold = Color3.fromRGB(255, 170, 45),
+	GoldArmor = Color3.fromRGB(235, 175, 55),
+	Red = Color3.fromRGB(150, 22, 32),
+	Dark = Color3.fromRGB(38, 43, 56),
+	White = Color3.fromRGB(225, 250, 255),
+	Warn = Color3.fromRGB(255, 70, 70),
+}
+
+local SND = {
+	Metal = "rbxasset://sounds/metal.mp3",
+	Ping = "rbxasset://sounds/electronicpingshort.wav",
+	Whoosh = "rbxasset://sounds/Rocket whoosh 01.mp3",
+	Shot = "rbxasset://sounds/Rocket shot.wav",
+	Boom = "rbxasset://sounds/impact_explosion_03.mp3",
+	Click = "rbxasset://sounds/clickfast.wav",
+	Lunge = "rbxasset://sounds/swordlunge.wav",
+}
+
+local CFG = {
+	Volume = 1,
+
+	FlightSpeed = 90,
+	BoostSpeed = 190,
+	Accel = 5,
+	MaxLean = 60,
+	BankAmount = 0.4,
+
+	MaxEnergy = 100,
+	Regen = 9,
+	FlightDrain = 1.5,
+	BoostDrain = 11,
+	RepulsorCost = 5,
+	MissileCost = 18,
+	OverdriveCost = 35,
+	OverdriveDuration = 7,
+	ShieldDrain = 7,
+	UnibeamDrain = 24,
+	StrikeCost = 45,
+
+	RepulsorCooldown = 0.6,
+	ChargeTime = 1.4,
+	MissileCooldown = 3,
+	MissileCount = 6,
+	MissileSpeed = 140,
+	OverdriveCooldown = 10,
+	StrikeCooldown = 22,
+	AimHold = 0.7,
+	ShieldRadius = 6.5,
+
+	LockRange = 300,
+	LockCone = 0.93,
+	MultiLockCone = 0.75,
+	ScanNPCs = true,
+	TargetTag = "SuitTarget",
+
+	BaseFOV = 70,
+	BoostFOV = 95,
+}
+
+--========================================================
+-- STATE
+--========================================================
+
+local S = {
+	Suit = false, Deploying = false, DeployStart = 0,
+	Flying = false, Boosting = false, BoostActive = false, HUD = true,
+	Charging = false, ChargeStart = 0, Busy = false, Muted = false,
+	Shield = false, Unibeam = false,
+	Energy = CFG.MaxEnergy,
+	Last = { Repulsor = 0, Missile = 0, Overdrive = 0, Strike = 0 },
+	OverdriveUntil = 0, AimUntil = 0, Facing = false,
+	Shake = 0, FovKick = 0, Vel = Vector3.zero, LeanDeg = 0, SpeedAlpha = 0,
+	Target = nil, TargetInfo = nil, Candidates = {},
+	LastScan = 0, LastCandidateRefresh = 0, LastGroundFx = 0, UniTick = 0,
+	StatusText = "", StatusTime = 0, LastLowWarn = 0, LastClank = 0, BootToken = 0,
+	TouchUp = false, TouchDown = false, FullChargeNotified = false,
+	LoopTarget = { Hum = 0, Flight = 0, Charge = 0, Beam = 0, Shield = 0 },
+}
+
+local clock = 0
+local Character, Humanoid, Root
+local Armor, Pieces, Thrusters, Shoulders, Loops = {}, {}, {}, {}, {}
+local Janitor, Connections = {}, {}
+local Reactor, ReactorLight, SuitHighlight, ChargeOrb, ChargeLight, PalmEmitter
+local FlightAttachment, FlightVelocity, FlightOrientation
+local ShieldPart, UniOuter, UniInner, UniGlow
+local Gui = {}
+local Controls
+local VFX = workspace:FindFirstChild("JARVIS_VFX") or Instance.new("Folder")
+VFX.Name = "JARVIS_VFX"
+VFX.Parent = workspace
+
+--========================================================
+-- HELPERS
+--========================================================
+
+local function connect(signal, fn)
+	local c = signal:Connect(fn)
+	table.insert(Connections, c)
+	return c
+end
+
+local function jconnect(signal, fn)
+	local c = signal:Connect(fn)
+	table.insert(Janitor, c)
+	return c
+end
+
+local function make(className, props, parent)
+	local obj = Instance.new(className)
+	for k, v in pairs(props or {}) do obj[k] = v end
+	obj.Parent = parent
+	return obj
+end
+
+local function tween(obj, duration, props, style, dir)
+	local t = TweenService:Create(obj, TweenInfo.new(duration,
+		style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), props)
+	t:Play()
+	return t
+end
+
+local function alive(inst)
+	return inst ~= nil and inst.Parent ~= nil
+end
+
+local function overdriveActive()
+	return os.clock() < S.OverdriveUntil
+end
+
+pcall(function()
+	Controls = require(Player:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule", 5)):GetControls()
+end)
+
+local function bindCharacter(char)
+	Character = char
+	Humanoid = char:WaitForChild("Humanoid")
+	Root = char:WaitForChild("HumanoidRootPart")
+end
+
+bindCharacter(Player.Character or Player.CharacterAdded:Wait())
+
+local function bodyPart(...)
+	if not Character then return nil end
+	for _, name in ipairs({ ... }) do
+		local p = Character:FindFirstChild(name)
+		if p and p:IsA("BasePart") then return p end
+	end
+	return nil
+end
+
+local function isR15()
+	return Humanoid and Humanoid.RigType == Enum.HumanoidRigType.R15
+end
+
+local function rayParams()
+	local p = RaycastParams.new()
+	p.FilterType = Enum.RaycastFilterType.Exclude
+	p.FilterDescendantsInstances = { Character, VFX }
+	p.IgnoreWater = true
+	return p
+end
+
+local function addShake(amount)
+	S.Shake = math.min(S.Shake + amount, 1.6)
+end
+
+local function rnd(a, b)
+	return a + math.random() * (b - a)
+end
+
+--========================================================
+-- SOUND
+--========================================================
+
+local function playSound(id, o)
+	if S.Muted then return end
+	o = o or {}
+	local parent, holder = o.Parent, nil
+	if not parent then
+		if o.Position then
+			holder = make("Part", {
+				Transparency = 1, Anchored = true, CanCollide = false,
+				CanQuery = false, CanTouch = false, Size = Vector3.one * 0.2,
+				Position = o.Position,
+			}, VFX)
+			parent = holder
+		else
+			parent = Root
+		end
+	end
+	if not parent then return end
+	local snd = make("Sound", {
+		SoundId = id,
+		Volume = (o.Volume or 0.6) * CFG.Volume,
+		PlaybackSpeed = o.Speed or 1,
+		RollOffMode = Enum.RollOffMode.InverseTapered,
+		RollOffMinDistance = 10,
+		RollOffMaxDistance = o.Range or 200,
+	}, parent)
+	if o.Reverb then
+		make("ReverbSoundEffect", {
+			DecayTime = 2.2, Density = 1, Diffusion = 1, DryLevel = 0, WetLevel = -5,
+		}, snd)
+	end
+	snd:Play()
+	Debris:AddItem(holder or snd, o.Life or 4)
+	return snd
+end
+
+local function createLoops()
+	local defs = {
+		Hum = { SND.Ping, 0.3 },
+		Flight = { SND.Whoosh, 1 },
+		Charge = { SND.Ping, 1 },
+		Beam = { SND.Whoosh, 2.3 },
+		Shield = { SND.Ping, 0.22 },
+	}
+	for name, d in pairs(defs) do
+		local s = make("Sound", {
+			Name = "JARVIS_Loop_" .. name, SoundId = d[1], Looped = true,
+			Volume = 0, PlaybackSpeed = d[2], RollOffMaxDistance = 160,
+		}, Root)
+		s:Play()
+		Loops[name] = s
+	end
+end
+
+local function destroyLoops()
+	for name, s in pairs(Loops) do
+		if alive(s) then s:Destroy() end
+		Loops[name] = nil
+	end
+	for k in pairs(S.LoopTarget) do S.LoopTarget[k] = 0 end
+end
+
+local function updateLoops(dt)
+	for name, s in pairs(Loops) do
+		if alive(s) then
+			local target = S.Muted and 0 or (S.LoopTarget[name] or 0) * CFG.Volume
+			s.Volume += (target - s.Volume) * math.clamp(dt * 8, 0, 1)
+		end
+	end
+end
+
+--========================================================
+-- VFX PRIMITIVES
+--========================================================
+
+local function glowBall(position, size, color, duration)
+	local part = make("Part", {
+		Name = "Glow", Shape = Enum.PartType.Ball,
+		Size = Vector3.one * size, CFrame = CFrame.new(position),
+		Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		CastShadow = false, Material = Enum.Material.Neon, Color = color,
+	}, VFX)
+	tween(part, duration, { Size = Vector3.one * 0.05, Transparency = 1 })
+	Debris:AddItem(part, duration + 0.15)
+	return part
+end
+
+local function beamBetween(a, b, color, thickness, duration)
+	local length = (b - a).Magnitude
+	if length < 0.05 then return end
+	local beam = make("Part", {
+		Name = "Beam", Size = Vector3.new(thickness, thickness, length),
+		CFrame = CFrame.lookAt((a + b) / 2, b),
+		Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		CastShadow = false, Material = Enum.Material.Neon, Color = color,
+	}, VFX)
+	tween(beam, duration, { Transparency = 1, Size = Vector3.new(0.02, 0.02, length) })
+	Debris:AddItem(beam, duration + 0.15)
+end
+
+-- jagged lightning arc between two points
+local function lightning(a, b, color, thickness, duration, segments, jitter)
+	segments = segments or 8
+	local dir = b - a
+	if dir.Magnitude < 0.5 then return end
+	local unit = dir.Unit
+	local p1 = unit:Cross(Vector3.yAxis)
+	if p1.Magnitude < 0.1 then p1 = unit:Cross(Vector3.xAxis) end
+	p1 = p1.Unit
+	local p2 = unit:Cross(p1)
+	local prev = a
+	for i = 1, segments do
+		local p = a + dir * (i / segments)
+		if i < segments then
+			p += p1 * (math.random() - 0.5) * jitter + p2 * (math.random() - 0.5) * jitter
+		end
+		beamBetween(prev, p, color, thickness, duration)
+		prev = p
+	end
+end
+
+local function particlesAt(position, color, count, speed)
+	local holder = make("Part", {
+		Name = "Sparks", Size = Vector3.one * 0.2, Position = position,
+		Transparency = 1, Anchored = true,
+		CanCollide = false, CanTouch = false, CanQuery = false,
+	}, VFX)
+	local att = make("Attachment", {}, holder)
+	local emitter = make("ParticleEmitter", {
+		Texture = "rbxasset://textures/particles/sparkles_main.dds",
+		Color = ColorSequence.new(color, C.White),
+		LightEmission = 1, Rate = 0,
+		Lifetime = NumberRange.new(0.25, 0.9),
+		Speed = NumberRange.new(speed * 0.35, speed),
+		SpreadAngle = Vector2.new(180, 180), Drag = 2,
+		Acceleration = Vector3.new(0, 3, 0),
+		Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.45),
+			NumberSequenceKeypoint.new(0.35, 0.2),
+			NumberSequenceKeypoint.new(1, 0),
+		}),
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0),
+			NumberSequenceKeypoint.new(1, 1),
+		}),
+	}, att)
+	emitter:Emit(count)
+	Debris:AddItem(holder, 2)
+end
+
+-- dust / smoke puff
+local function dustAt(position, color, count, speed)
+	local holder = make("Part", {
+		Name = "Dust", Size = Vector3.one * 0.2, Position = position,
+		Transparency = 1, Anchored = true,
+		CanCollide = false, CanTouch = false, CanQuery = false,
+	}, VFX)
+	local att = make("Attachment", {}, holder)
+	local emitter = make("ParticleEmitter", {
+		Texture = "rbxasset://textures/particles/smoke_main.dds",
+		Color = ColorSequence.new(color),
+		Rate = 0, Lifetime = NumberRange.new(0.8, 1.6),
+		Speed = NumberRange.new(speed * 0.3, speed),
+		SpreadAngle = Vector2.new(70, 70), Drag = 3,
+		Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 1.5),
+			NumberSequenceKeypoint.new(1, 6),
+		}),
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.5),
+			NumberSequenceKeypoint.new(1, 1),
+		}),
+	}, att)
+	emitter:Emit(count)
+	Debris:AddItem(holder, 3)
+end
+
+-- flat disc facing "normal"
+local function disc(position, normal, radius, thickness, color, transparency, material)
+	normal = normal or Vector3.yAxis
+	local cf
+	if math.abs(normal:Dot(Vector3.yAxis)) > 0.999 then
+		cf = CFrame.new(position) * CFrame.Angles(0, 0, math.pi / 2)
+	else
+		cf = CFrame.lookAt(position, position + normal) * CFrame.Angles(0, math.pi / 2, 0)
+	end
+	return make("Part", {
+		Name = "Disc", Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(thickness, radius * 2, radius * 2), CFrame = cf,
+		Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		CastShadow = false, Material = material or Enum.Material.Neon,
+		Color = color, Transparency = transparency or 0,
+	}, VFX)
+end
+
+local function shockwave(position, color, radius, duration, thickness, normal)
+	local ring = disc(position, normal, 1, thickness or 0.3, color, 0.1)
+	tween(ring, duration, {
+		Size = Vector3.new(thickness or 0.3, radius * 2, radius * 2),
+		Transparency = 1,
+	})
+	Debris:AddItem(ring, duration + 0.15)
+end
+
+-- ballistic debris (no physics engine, no pushing the player)
+local DebrisList = {}
+
+local function spawnDebris(position, color, count, speed)
+	for _ = 1, count do
+		local s = rnd(0.15, 0.5)
+		local p = make("Part", {
+			Size = Vector3.new(s, s * rnd(0.5, 1.4), s),
+			CFrame = CFrame.new(position) * CFrame.Angles(rnd(0, 6), rnd(0, 6), rnd(0, 6)),
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+			CastShadow = false, Material = Enum.Material.Slate, Color = color,
+		}, VFX)
+		local v = Vector3.new(rnd(-1, 1), rnd(0.5, 1.6), rnd(-1, 1))
+		table.insert(DebrisList, {
+			Part = p, Vel = v.Unit * speed * rnd(0.4, 1.1),
+			Spin = Vector3.new(rnd(-9, 9), rnd(-9, 9), rnd(-9, 9)),
+			Life = rnd(0.8, 1.5), Age = 0,
+		})
+	end
+end
+
+local function stepDebris(dt)
+	for i = #DebrisList, 1, -1 do
+		local d = DebrisList[i]
+		d.Age += dt
+		if d.Age >= d.Life or not alive(d.Part) then
+			if alive(d.Part) then d.Part:Destroy() end
+			table.remove(DebrisList, i)
+		else
+			d.Vel += Vector3.new(0, -70 * dt, 0)
+			d.Part.CFrame = d.Part.CFrame * CFrame.Angles(d.Spin.X * dt, d.Spin.Y * dt, d.Spin.Z * dt) + d.Vel * dt
+			d.Part.Transparency = math.clamp((d.Age / d.Life - 0.6) * 2.5, 0, 1)
+		end
+	end
+end
+
+local function explosion(position, color, scale, silent)
+	glowBall(position, 3 * scale, color, 0.35)
+	glowBall(position, 8 * scale, C.White, 0.5)
+	glowBall(position, 15 * scale, color, 0.8)
+	particlesAt(position, color, math.floor(60 * scale), 35 * scale)
+	shockwave(position, color, 10 * scale, 0.5, 0.2)
+
+	for i = 1, 10 do
+		local a = i / 10 * math.pi * 2
+		local dir = Vector3.new(math.cos(a), rnd(0.1, 0.6), math.sin(a))
+		lightning(position, position + dir * 12 * scale, color, 0.18 * scale, 0.4, 4, 2.5 * scale)
+	end
+
+	if not silent then
+		playSound(SND.Boom, {
+			Position = position, Volume = math.clamp(0.35 * scale, 0.2, 1),
+			Speed = math.clamp(1.3 - scale * 0.25, 0.5, 1.3) + math.random() * 0.1,
+			Range = 280, Reverb = scale > 1,
+		})
+	end
+
+	if Root then
+		local dist = (Root.Position - position).Magnitude
+		addShake(math.clamp(scale * 0.35 * (1 - dist / 140), 0, 0.7))
+	end
+end
+
+-- impact on a surface: blast, scorch mark, debris, dust
+local function impactAt(position, normal, color, scale, hitInstance, silent)
+	normal = normal or Vector3.yAxis
+	explosion(position, color, scale, silent)
+	shockwave(position + normal * 0.1, color, 7 * scale, 0.45, 0.15, normal)
+
+	local scorch = disc(position + normal * 0.06, normal, 1.6 * scale, 0.05,
+		Color3.fromRGB(18, 18, 20), 0.15, Enum.Material.SmoothPlastic)
+	scorch.CastShadow = false
+	task.delay(2.5, function()
+		if alive(scorch) then tween(scorch, 1.5, { Transparency = 1 }) end
+	end)
+	Debris:AddItem(scorch, 4.2)
+
+	local col = Color3.fromRGB(120, 110, 100)
+	if hitInstance and hitInstance:IsA("BasePart") then
+		col = hitInstance.Color:Lerp(Color3.fromRGB(110, 105, 100), 0.4)
+	end
+	spawnDebris(position + normal * 0.3, col, math.floor(10 * scale + 4), 26 * scale + 8)
+	dustAt(position + normal * 0.4, col:Lerp(Color3.new(1, 1, 1), 0.35), math.floor(6 * scale + 2), 10 * scale + 4)
+end
+
+local function screenFlash(color, strength, duration)
+	local cc = make("ColorCorrectionEffect", {
+		TintColor = color, Brightness = strength, Saturation = 0.2,
+	}, Lighting)
+	local t = tween(cc, duration, { Brightness = 0, TintColor = Color3.new(1, 1, 1), Saturation = 0 })
+	t.Completed:Connect(function() cc:Destroy() end)
+	Debris:AddItem(cc, duration + 0.5)
+end
+
+--========================================================
+-- HUD
+--========================================================
+
+local function frame(parent, props)
+	props.BorderSizePixel = 0
+	if props.BackgroundTransparency == nil then props.BackgroundTransparency = 1 end
+	return make("Frame", props, parent)
+end
+
+local function stroke(parent, color, thickness, transparency)
+	return make("UIStroke", {
+		Color = color or C.Cyan, Thickness = thickness or 1.5, Transparency = transparency or 0.2,
+	}, parent)
+end
+
+local function label(parent, text, pos, size, color, textSize, align)
+	return make("TextLabel", {
+		Position = pos, Size = size, BackgroundTransparency = 1,
+		Text = text, Font = Enum.Font.Code, TextSize = textSize, TextColor3 = color,
+		TextXAlignment = align or Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+	}, parent)
+end
+
+local function bar(parent, y, color, height)
+	local back = frame(parent, {
+		Position = UDim2.fromOffset(13, y), Size = UDim2.new(1, -26, 0, height),
+		BackgroundColor3 = Color3.fromRGB(30, 40, 55), BackgroundTransparency = 0,
+	})
+	make("UICorner", { CornerRadius = UDim.new(1, 0) }, back)
+	local fill = frame(parent, {})
+	fill.Parent = back
+	fill.Size = UDim2.fromScale(0, 1)
+	fill.BackgroundColor3 = color
+	fill.BackgroundTransparency = 0
+	make("UICorner", { CornerRadius = UDim.new(1, 0) }, fill)
+	return fill
+end
+
+local function touchButton(parent, text, pos, onDown, onUp)
+	local b = make("TextButton", {
+		Text = text, Font = Enum.Font.Code, TextSize = 14, TextColor3 = C.Cyan,
+		BackgroundColor3 = Color3.fromRGB(5, 12, 23), BackgroundTransparency = 0.25,
+		Size = UDim2.fromOffset(58, 58), Position = pos,
+	}, parent)
+	make("UICorner", { CornerRadius = UDim.new(1, 0) }, b)
+	stroke(b, C.Cyan, 1.5, 0.2)
+	b.MouseButton1Down:Connect(onDown)
+	if onUp then
+		b.MouseButton1Up:Connect(onUp)
+		b.MouseLeave:Connect(onUp)
+	end
+	return b
+end
+
+local suitToggle, toggleFlight, startCharge, fireRepulsor, fireMissiles
+local overdrive, strike, setShield, startUnibeam, stopUnibeam, emergency
+
+local COMPASS = { [0] = "N", [45] = "NE", [90] = "E", [135] = "SE", [180] = "S", [225] = "SW", [270] = "W", [315] = "NW" }
+
+local function createHUD()
+	local old = PlayerGui:FindFirstChild("JARVIS_INFINITY_HUD")
+	if old then old:Destroy() end
+
+	local gui = make("ScreenGui", {
+		Name = "JARVIS_INFINITY_HUD", ResetOnSpawn = false,
+		IgnoreGuiInset = true, DisplayOrder = 50,
+	}, PlayerGui)
+	Gui.Root = gui
+
+	-- speed lines live outside the toggleable HUD
+	local lines = frame(gui, { Size = UDim2.fromScale(1, 1), ClipsDescendants = true })
+	Gui.SpeedLines = {}
+	for i = 1, 30 do
+		local l = frame(lines, {
+			AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = C.White,
+			BackgroundTransparency = 1, Size = UDim2.fromOffset(2, 140),
+		})
+		table.insert(Gui.SpeedLines, { Frame = l, Angle = (i / 30) * math.pi * 2 + rnd(-0.08, 0.08), Phase = math.random() })
+	end
+
+	local hud = frame(gui, { Size = UDim2.fromScale(1, 1) })
+	Gui.HUD = hud
+
+	-- LEFT PANEL
+	local panel = frame(hud, {
+		Position = UDim2.fromOffset(24, 110), Size = UDim2.fromOffset(290, 270),
+		BackgroundColor3 = Color3.fromRGB(5, 12, 23), BackgroundTransparency = 0.15,
+	})
+	make("UICorner", { CornerRadius = UDim.new(0, 12) }, panel)
+	stroke(panel)
+	Gui.Panel = panel
+
+	label(panel, "J.A.R.V.I.S.  //  MARK ∞", UDim2.fromOffset(13, 8), UDim2.new(1, -26, 0, 24), C.Cyan, 18)
+	Gui.Status = label(panel, "SYSTEM STANDBY", UDim2.fromOffset(13, 34), UDim2.new(1, -26, 0, 18), C.White, 12)
+
+	label(panel, "ARC REACTOR", UDim2.fromOffset(13, 56), UDim2.new(1, -26, 0, 12), C.Cyan, 10)
+	Gui.Energy = bar(panel, 70, C.Cyan, 8)
+	Gui.EnergyText = label(panel, "100%", UDim2.new(1, -73, 0, 56), UDim2.fromOffset(60, 12), C.Cyan, 10, Enum.TextXAlignment.Right)
+
+	label(panel, "SUIT INTEGRITY", UDim2.fromOffset(13, 84), UDim2.new(1, -26, 0, 12), C.White, 10)
+	Gui.Integrity = bar(panel, 98, Color3.fromRGB(90, 255, 140), 6)
+
+	label(panel, "REPULSOR CHARGE", UDim2.fromOffset(13, 110), UDim2.new(1, -26, 0, 12), C.Gold, 10)
+	Gui.Charge = bar(panel, 124, C.Gold, 6)
+
+	Gui.Cooldowns = {}
+	for i, n in ipairs({ "REP", "MSL", "OVR", "STK" }) do
+		local x = 13 + (i - 1) * 68
+		label(panel, n, UDim2.fromOffset(x, 136), UDim2.fromOffset(30, 12), C.White, 9)
+		local back = frame(panel, {
+			Position = UDim2.fromOffset(x, 150), Size = UDim2.fromOffset(62, 4),
+			BackgroundColor3 = Color3.fromRGB(30, 40, 55), BackgroundTransparency = 0,
+		})
+		Gui.Cooldowns[n] = frame(back, {
+			Size = UDim2.fromScale(1, 1), BackgroundColor3 = C.Cyan, BackgroundTransparency = 0,
+		})
+	end
+
+	Gui.Modules = label(panel, "", UDim2.fromOffset(13, 160), UDim2.new(1, -26, 0, 14), C.Gold, 10)
+	Gui.Target = label(panel, "TARGET: NONE", UDim2.fromOffset(13, 176), UDim2.new(1, -26, 0, 14), C.Cyan, 10)
+	Gui.Telemetry = label(panel, "SPD 0   ALT 0", UDim2.fromOffset(13, 192), UDim2.new(1, -26, 0, 14), C.White, 10)
+	label(panel, "J SUIT F FLY V BOOST Q FIRE R MSL\nC UNIBEAM G SHIELD T STRIKE E OVERDRIVE\nH HUD  M MUTE  X SHUTDOWN",
+		UDim2.fromOffset(13, 212), UDim2.new(1, -26, 0, 50), Color3.fromRGB(155, 190, 215), 9)
+
+	-- boot log
+	Gui.Log = label(hud, "", UDim2.new(0, 330, 0.34, 0), UDim2.fromOffset(380, 130), C.Cyan, 13)
+
+	-- COMPASS
+	local comp = frame(hud, {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 12),
+		Size = UDim2.fromOffset(460, 34), ClipsDescendants = true,
+		BackgroundColor3 = Color3.fromRGB(5, 12, 23), BackgroundTransparency = 0.4,
+	})
+	make("UICorner", { CornerRadius = UDim.new(0, 8) }, comp)
+	stroke(comp, C.Cyan, 1, 0.4)
+	frame(comp, {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0),
+		Size = UDim2.fromOffset(2, 8), BackgroundColor3 = C.Gold, BackgroundTransparency = 0,
+	})
+	Gui.Heading = label(comp, "000", UDim2.fromScale(0.5, 0.52), UDim2.fromOffset(60, 14), C.Gold, 11, Enum.TextXAlignment.Center)
+	Gui.Heading.AnchorPoint = Vector2.new(0.5, 0)
+	Gui.Ticks = {}
+	for i = 0, 23 do
+		local deg = i * 15
+		local t = label(comp, COMPASS[deg] or "|", UDim2.fromOffset(0, 8), UDim2.fromOffset(30, 14),
+			COMPASS[deg] and C.White or C.Cyan, COMPASS[deg] and 13 or 9, Enum.TextXAlignment.Center)
+		t.AnchorPoint = Vector2.new(0.5, 0)
+		table.insert(Gui.Ticks, { Label = t, Deg = deg })
+	end
+
+	-- RADAR
+	local radar = frame(hud, {
+		AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 24, 1, -24),
+		Size = UDim2.fromOffset(150, 150),
+		BackgroundColor3 = Color3.fromRGB(5, 12, 23), BackgroundTransparency = 0.25,
+	})
+	make("UICorner", { CornerRadius = UDim.new(1, 0) }, radar)
+	stroke(radar, C.Cyan, 1.5, 0.15)
+	for _, r in ipairs({ 50, 100 }) do
+		local ring = frame(radar, {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(r, r),
+		})
+		make("UICorner", { CornerRadius = UDim.new(1, 0) }, ring)
+		stroke(ring, C.Cyan, 1, 0.75)
+	end
+	frame(radar, { Position = UDim2.new(0.5, -1, 0, 4), Size = UDim2.new(0, 1, 1, -8), BackgroundColor3 = C.Cyan, BackgroundTransparency = 0.8 })
+	frame(radar, { Position = UDim2.new(0, 4, 0.5, -1), Size = UDim2.new(1, -8, 0, 1), BackgroundColor3 = C.Cyan, BackgroundTransparency = 0.8 })
+	frame(radar, {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(6, 6), BackgroundColor3 = C.Gold, BackgroundTransparency = 0,
+	})
+	local sweep = frame(radar, {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(1, 1),
+	})
+	frame(sweep, {
+		Position = UDim2.new(0.5, -1, 0, 4), Size = UDim2.new(0, 2, 0.5, -4),
+		BackgroundColor3 = C.Cyan, BackgroundTransparency = 0.35,
+	})
+	Gui.RadarSweep = sweep
+	Gui.Blips = {}
+	for _ = 1, 24 do
+		local b = frame(radar, {
+			AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(6, 6),
+			BackgroundColor3 = C.Warn, BackgroundTransparency = 0, Visible = false,
+		})
+		make("UICorner", { CornerRadius = UDim.new(1, 0) }, b)
+		table.insert(Gui.Blips, b)
+	end
+
+	-- RETICLE
+	local reticle = frame(hud, {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(36, 36),
+	})
+	Gui.Reticle = reticle
+	Gui.ReticleParts = {}
+	for _, spec in ipairs({
+		{ UDim2.new(0.5, -1, 0, 0), UDim2.fromOffset(2, 10) },
+		{ UDim2.new(0.5, -1, 1, -10), UDim2.fromOffset(2, 10) },
+		{ UDim2.new(0, 0, 0.5, -1), UDim2.fromOffset(10, 2) },
+		{ UDim2.new(1, -10, 0.5, -1), UDim2.fromOffset(10, 2) },
+	}) do
+		table.insert(Gui.ReticleParts, frame(reticle, {
+			Position = spec[1], Size = spec[2], BackgroundColor3 = C.Cyan, BackgroundTransparency = 0,
+		}))
+	end
+	local ring = frame(hud, {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(50, 50),
+	})
+	make("UICorner", { CornerRadius = UDim.new(1, 0) }, ring)
+	Gui.RingStroke = stroke(ring, C.Cyan, 1.5, 0.6)
+	Gui.Ring = ring
+
+	-- TARGET BRACKETS
+	local br = frame(hud, {
+		AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(90, 90), Visible = false,
+	})
+	Gui.Brackets = br
+	Gui.BracketLines = {}
+	for _, spec in ipairs({
+		{ UDim2.fromOffset(0, 0), UDim2.fromOffset(14, 2) }, { UDim2.fromOffset(0, 0), UDim2.fromOffset(2, 14) },
+		{ UDim2.new(1, -14, 0, 0), UDim2.fromOffset(14, 2) }, { UDim2.new(1, -2, 0, 0), UDim2.fromOffset(2, 14) },
+		{ UDim2.new(0, 0, 1, -2), UDim2.fromOffset(14, 2) }, { UDim2.new(0, 0, 1, -14), UDim2.fromOffset(2, 14) },
+		{ UDim2.new(1, -14, 1, -2), UDim2.fromOffset(14, 2) }, { UDim2.new(1, -2, 1, -14), UDim2.fromOffset(2, 14) },
+	}) do
+		table.insert(Gui.BracketLines, frame(br, {
+			Position = spec[1], Size = spec[2], BackgroundColor3 = C.Warn, BackgroundTransparency = 0,
+		}))
+	end
+	Gui.BracketText = label(br, "", UDim2.new(0, 0, 1, 6), UDim2.new(1, 40, 0, 28), C.Warn, 10, Enum.TextXAlignment.Left)
+	Gui.BracketText.Position = UDim2.new(0, -20, 1, 6)
+	Gui.BracketText.TextXAlignment = Enum.TextXAlignment.Center
+
+	-- TOUCH
+	if UIS.TouchEnabled then
+		local d = 64
+		local function p(col, row)
+			return UDim2.new(1, -(col * d + 6), 1, -(row * d + 16))
+		end
+		touchButton(gui, "SUIT", p(1, 1), function() suitToggle() end)
+		touchButton(gui, "FLY", p(2, 1), function() toggleFlight() end)
+		touchButton(gui, "FIRE", p(3, 1), function() startCharge() end,
+			function() if S.Charging then fireRepulsor() end end)
+		touchButton(gui, "MSL", p(1, 2), function() fireMissiles() end)
+		touchButton(gui, "OVR", p(2, 2), function() task.spawn(overdrive) end)
+		touchButton(gui, "BOOST", p(3, 2), function() S.Boosting = true end, function() S.Boosting = false end)
+		touchButton(gui, "UP", p(1, 3), function() S.TouchUp = true end, function() S.TouchUp = false end)
+		touchButton(gui, "DOWN", p(2, 3), function() S.TouchDown = true end, function() S.TouchDown = false end)
+		touchButton(gui, "BEAM", p(3, 3), function() startUnibeam() end, function() stopUnibeam() end)
+		touchButton(gui, "SHLD", p(4, 1), function() setShield(not S.Shield) end)
+		touchButton(gui, "STRK", p(4, 2), function() task.spawn(strike) end)
+	end
+end
+
+createHUD()
+
+local function setStatus(text)
+	S.StatusText = text
+	S.StatusTime = os.clock()
+	if Gui.Status then Gui.Status.Text = text end
+end
+
+local function baseStatus()
+	if not S.Suit then return "SYSTEM STANDBY" end
+	if S.Deploying then return "ARMOR ASSEMBLY IN PROGRESS" end
+	if S.Unibeam then return "UNIBEAM ACTIVE" end
+	if overdriveActive() then return "OVERDRIVE ACTIVE // POWER SURGE" end
+	if S.Flying then return S.BoostActive and "FLIGHT // BOOST" or "FLIGHT ONLINE" end
+	return "MARK ∞ ONLINE"
+end
+
+local function applyHudVisibility()
+	if Gui.HUD then Gui.HUD.Visible = S.HUD end
+end
+
+local function bootLog(lines)
+	S.BootToken += 1
+	local token = S.BootToken
+	Gui.Log.Text = ""
+	Gui.Log.TextTransparency = 0
+	task.spawn(function()
+		local text = ""
+		for _, line in ipairs(lines) do
+			for i = 1, #line do
+				if token ~= S.BootToken then return end
+				text ..= line:sub(i, i)
+				Gui.Log.Text = text
+				if i % 3 == 0 then
+					playSound(SND.Click, { Volume = 0.1, Speed = 2.2 + math.random() * 0.4 })
+				end
+				task.wait(0.012)
+			end
+			text ..= "\n"
+			task.wait(0.08)
+		end
+		task.wait(3.5)
+		if token == S.BootToken then tween(Gui.Log, 1, { TextTransparency = 1 }) end
+	end)
+end
+
+--========================================================
+-- ARM POSING
+--========================================================
+
+local function setupShoulders()
+	table.clear(Shoulders)
+	local r15 = isR15()
+	local holder = r15 and Character:FindFirstChild("UpperTorso") or Character:FindFirstChild("Torso")
+	if not holder then return end
+	for _, side in ipairs({ "Left", "Right" }) do
+		local m = holder:FindFirstChild(r15 and (side .. "Shoulder") or (side .. " Shoulder"))
+		if m and m:IsA("Motor6D") then
+			Shoulders[side] = { Motor = m, Orig = m.C0, Angle = 0 }
+		end
+	end
+end
+
+local function restorePose()
+	for _, s in pairs(Shoulders) do
+		if alive(s.Motor) then s.Motor.C0 = s.Orig end
+	end
+	table.clear(Shoulders)
+end
+
+local function applyPose(dt, left, right)
+	local r15 = isR15()
+	local targets = { Left = left, Right = right }
+	for side, s in pairs(Shoulders) do
+		if alive(s.Motor) then
+			local t = math.rad(targets[side] or 0)
+			s.Angle += (t - s.Angle) * math.clamp(dt * 12, 0, 1)
+			if r15 then
+				s.Motor.C0 = s.Orig * CFrame.Angles(s.Angle, 0, 0)
+			else
+				local sign = side == "Right" and 1 or -1
+				s.Motor.C0 = s.Orig * CFrame.Angles(0, 0, s.Angle * sign)
+			end
+		end
+	end
+end
+
+--========================================================
+-- ARMOR  (pieces fly in from all directions and snap on)
+--========================================================
+
+local METAL = Enum.Material.Metal
+
+local function piece(name, body, size, offset, color, material, shape, opts)
+	if not body then return nil end
+	opts = opts or {}
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Size = size
+	part.Color = color
+	part.Material = material or METAL
+	part.Reflectance = (material == Enum.Material.Neon) and 0 or 0.12
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Massless = true
+	part.Transparency = 1
+	if shape then part.Shape = shape end
+
+	local final = body.CFrame * offset
+	local away = Vector3.new(rnd(-1, 1), rnd(-0.2, 1), rnd(-1, 1))
+	if away.Magnitude < 0.1 then away = Vector3.yAxis end
+	local start = CFrame.new(final.Position + away.Unit * rnd(16, 34))
+		* CFrame.Angles(rnd(0, 6.28), rnd(0, 6.28), rnd(0, 6.28))
+	part.CFrame = start
+	part.Parent = VFX
+	part:SetAttribute("T", opts.T or 0)
+	if opts.Head then part:SetAttribute("HeadGear", true) end
+
+	table.insert(Pieces, {
+		Part = part, Body = body, Offset = offset, Start = start,
+		Delay = (#Pieces) * 0.03 + math.random() * 0.15,
+		Dur = rnd(0.5, 0.8), Done = false, Final = opts.T or 0,
+	})
+	return part
+end
+
+local function addThruster(body, color)
+	if not body then return end
+	local att = make("Attachment", {
+		Name = "JARVIS_Thruster", CFrame = CFrame.new(0, -body.Size.Y / 2, 0),
+	}, body)
+	local em = make("ParticleEmitter", {
+		Texture = "rbxasset://textures/particles/sparkles_main.dds",
+		Color = ColorSequence.new(color, C.White),
+		LightEmission = 1, Rate = 70, Enabled = false,
+		EmissionDirection = Enum.NormalId.Bottom,
+		Lifetime = NumberRange.new(0.2, 0.5),
+		Speed = NumberRange.new(10, 18), SpreadAngle = Vector2.new(8, 8),
+		Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.7),
+			NumberSequenceKeypoint.new(1, 0),
+		}),
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0),
+			NumberSequenceKeypoint.new(1, 1),
+		}),
+	}, att)
+	local ta = make("Attachment", { Name = "JARVIS_TrailA", CFrame = CFrame.new(-0.25, -body.Size.Y / 2, 0) }, body)
+	local tb = make("Attachment", { Name = "JARVIS_TrailB", CFrame = CFrame.new(0.25, -body.Size.Y / 2, 0) }, body)
+	local trail = make("Trail", {
+		Attachment0 = ta, Attachment1 = tb, Lifetime = 0.8, Enabled = false,
+		Color = ColorSequence.new(color, C.White), LightEmission = 1,
+		Transparency = NumberSequence.new(0.2, 1),
+		WidthScale = NumberSequence.new(1, 0),
+	}, body)
+	table.insert(Thrusters, { Emitter = em, Trail = trail, Attachments = { att, ta, tb } })
+end
+
+local function createArmor()
+	local r15 = isR15()
+	local RED, GOLD, DARK = C.Red, C.GoldArmor, C.Dark
+	local NEON, BALL, CYL = Enum.Material.Neon, Enum.PartType.Ball, Enum.PartType.Cylinder
+
+	local upper = bodyPart("UpperTorso", "Torso")
+	local lower = bodyPart("LowerTorso", "Torso")
+	local head = bodyPart("Head")
+	local armL, armR = bodyPart("LeftUpperArm", "Left Arm"), bodyPart("RightUpperArm", "Right Arm")
+	local foreL = r15 and bodyPart("LeftLowerArm") or nil
+	local foreR = r15 and bodyPart("RightLowerArm") or nil
+	local handL, handR = bodyPart("LeftHand", "Left Arm"), bodyPart("RightHand", "Right Arm")
+	local thighL, thighR = bodyPart("LeftUpperLeg", "Left Leg"), bodyPart("RightUpperLeg", "Right Leg")
+	local shinL = r15 and bodyPart("LeftLowerLeg") or nil
+	local shinR = r15 and bodyPart("RightLowerLeg") or nil
+	local footL, footR = bodyPart("LeftFoot", "Left Leg"), bodyPart("RightFoot", "Right Leg")
+
+	local ux, uy, uz = upper.Size.X, upper.Size.Y, upper.Size.Z
+	local fz = -uz / 2
+
+	-- chest
+	piece("Chest", upper, Vector3.new(ux * 1.06, uy * 0.58, 0.34), CFrame.new(0, uy * 0.1, fz - 0.1), RED)
+	piece("ChestTop", upper, Vector3.new(ux * 1.1, uy * 0.18, 0.42), CFrame.new(0, uy * 0.38, fz - 0.07), GOLD)
+	piece("ChestSideL", upper, Vector3.new(0.3, uy * 0.5, 0.4), CFrame.new(-ux * 0.5, uy * 0.1, fz - 0.05), DARK)
+	piece("ChestSideR", upper, Vector3.new(0.3, uy * 0.5, 0.4), CFrame.new(ux * 0.5, uy * 0.1, fz - 0.05), DARK)
+	piece("ReactorRim", upper, Vector3.new(0.18, 1.05, 1.05),
+		CFrame.new(0, uy * 0.12, fz - 0.24) * CFrame.Angles(0, math.pi / 2, 0), GOLD, METAL, CYL)
+	local core = piece("ReactorCore", upper, Vector3.one * 0.64,
+		CFrame.new(0, uy * 0.12, fz - 0.3), C.Cyan, NEON, BALL)
+	piece("ReactorInner", upper, Vector3.one * 0.3,
+		CFrame.new(0, uy * 0.12, fz - 0.4), C.White, NEON, BALL)
+	if core then
+		Reactor = core
+		ReactorLight = make("PointLight", { Color = C.Cyan, Brightness = 3, Range = 16 }, core)
+	end
+
+	-- waist
+	local absBody = r15 and lower or upper
+	local absY = r15 and 0 or -uy * 0.34
+	piece("Abs", absBody, Vector3.new(absBody.Size.X * 1.02, r15 and 0.55 or 0.7, 0.3),
+		CFrame.new(0, absY, -absBody.Size.Z / 2 - 0.05), RED)
+	piece("Belt", absBody, Vector3.new(absBody.Size.X * 1.08, 0.18, absBody.Size.Z * 1.1),
+		CFrame.new(0, r15 and 0.12 or -uy * 0.2, 0), GOLD)
+
+	-- back unit with thruster nozzles
+	piece("BackPack", upper, Vector3.new(ux * 0.82, uy * 0.7, 0.45), CFrame.new(0, uy * 0.02, uz / 2 + 0.25), DARK)
+	for _, sx in ipairs({ -0.38, 0.38 }) do
+		piece("BackNozzle", upper, Vector3.new(0.7, 0.55, 0.55),
+			CFrame.new(sx * ux * 0.7, -uy * 0.18, uz / 2 + 0.55) * CFrame.Angles(0, 0, math.pi / 2), GOLD, METAL, CYL)
+		piece("BackNozzleGlow", upper, Vector3.new(0.12, 0.4, 0.4),
+			CFrame.new(sx * ux * 0.7, -uy * 0.18 - 0.36, uz / 2 + 0.55) * CFrame.Angles(0, 0, math.pi / 2), C.Cyan, NEON, CYL)
+	end
+
+	-- shoulders and arms
+	for i, body in ipairs({ armL, armR }) do
+		if body then
+			local sx = (i == 1) and -1 or 1
+			piece("Pauldron", body, Vector3.new(body.Size.X * 1.35, 0.5, body.Size.Z * 1.4),
+				CFrame.new(0, body.Size.Y * 0.4, 0), RED)
+			piece("PauldronTrim", body, Vector3.new(body.Size.X * 1.4, 0.12, body.Size.Z * 1.45),
+				CFrame.new(0, body.Size.Y * 0.4 - 0.28, 0), GOLD)
+			piece("ShoulderJoint", body, Vector3.one * 0.55, CFrame.new(sx * 0.05, body.Size.Y * 0.28, 0), DARK, METAL, BALL)
+			if r15 then
+				piece("UpperArmPlate", body, Vector3.new(body.Size.X * 1.14, body.Size.Y * 0.5, body.Size.Z * 1.14),
+					CFrame.new(0, -body.Size.Y * 0.1, 0), RED)
+				piece("Elbow", body, Vector3.one * 0.5, CFrame.new(0, -body.Size.Y * 0.5, 0), GOLD, METAL, BALL)
+			else
+				piece("ArmSleeve", body, Vector3.new(body.Size.X * 1.14, body.Size.Y * 0.55, body.Size.Z * 1.14),
+					CFrame.new(0, -body.Size.Y * 0.1, 0), RED)
+			end
+		end
+	end
+	for _, body in ipairs({ foreL, foreR }) do
+		if body then
+			piece("Forearm", body, Vector3.new(body.Size.X * 1.22, body.Size.Y * 0.8, body.Size.Z * 1.22),
+				CFrame.new(0, 0.05, 0), RED)
+			piece("ForearmGlow", body, Vector3.new(0.18, body.Size.Y * 0.5, 0.06),
+				CFrame.new(0, 0.05, -body.Size.Z * 0.64), C.Cyan, NEON)
+			piece("WristBand", body, Vector3.new(body.Size.X * 1.28, 0.16, body.Size.Z * 1.28),
+				CFrame.new(0, -body.Size.Y * 0.42, 0), GOLD)
+		end
+	end
+	for _, hand in ipairs({ handL, handR }) do
+		if hand then
+			if r15 then
+				piece("Gauntlet", hand, hand.Size * Vector3.new(1.18, 0.9, 1.18), CFrame.new(0, 0.02, 0), DARK)
+			end
+			piece("PalmRing", hand, Vector3.new(0.1, 0.62, 0.62),
+				CFrame.new(0, -hand.Size.Y * 0.5 - 0.02, 0) * CFrame.Angles(0, 0, math.pi / 2), GOLD, METAL, CYL)
+			piece("PalmCore", hand, Vector3.new(0.12, 0.42, 0.42),
+				CFrame.new(0, -hand.Size.Y * 0.5 - 0.06, 0) * CFrame.Angles(0, 0, math.pi / 2), C.Cyan, NEON, CYL)
+		end
+	end
+	if handR then
+		ChargeOrb = piece("ChargeOrb", handR, Vector3.one * 0.3,
+			CFrame.new(0, -handR.Size.Y * 0.5 - 0.4, 0), C.Cyan, NEON, BALL, { T = 1 })
+		if ChargeOrb then
+			ChargeLight = make("PointLight", { Color = C.Cyan, Brightness = 0, Range = 14 }, ChargeOrb)
+			local att = make("Attachment", {}, ChargeOrb)
+			PalmEmitter = make("ParticleEmitter", {
+				Texture = "rbxasset://textures/particles/sparkles_main.dds",
+				Color = ColorSequence.new(C.Cyan, C.White),
+				LightEmission = 1, Rate = 50, Enabled = false,
+				Lifetime = NumberRange.new(0.2, 0.4), Speed = NumberRange.new(2, 7),
+				SpreadAngle = Vector2.new(180, 180), Size = NumberSequence.new(0.3, 0),
+			}, att)
+		end
+	end
+
+	-- legs
+	for i, body in ipairs({ thighL, thighR }) do
+		if body then
+			piece("ThighPlate", body, Vector3.new(body.Size.X * 1.15, body.Size.Y * (r15 and 0.7 or 0.5), body.Size.Z * 1.2),
+				CFrame.new(0, r15 and 0.05 or body.Size.Y * 0.18, 0), RED)
+			piece("ThighStripe", body, Vector3.new(0.14, body.Size.Y * 0.5, 0.06),
+				CFrame.new(0, 0, -body.Size.Z * 0.62), GOLD, NEON)
+			if r15 then
+				piece("Knee", body, Vector3.new(0.6, 0.45, 0.6), CFrame.new(0, -body.Size.Y * 0.5, 0), GOLD, METAL, BALL)
+			end
+		end
+	end
+	for _, body in ipairs({ shinL, shinR }) do
+		if body then
+			piece("ShinPlate", body, Vector3.new(body.Size.X * 1.18, body.Size.Y * 0.8, body.Size.Z * 1.25),
+				CFrame.new(0, 0.05, -0.02), RED)
+			piece("ShinGlow", body, Vector3.new(0.12, body.Size.Y * 0.5, 0.06),
+				CFrame.new(0, 0, -body.Size.Z * 0.7), C.Cyan, NEON)
+		end
+	end
+	for i, body in ipairs({ footL, footR }) do
+		if body then
+			piece("Boot", body, body.Size * Vector3.new(1.22, r15 and 1.25 or 0.3, 1.25),
+				CFrame.new(0, r15 and 0 or -body.Size.Y * 0.35, 0), DARK)
+			piece("BootToe", body, Vector3.new(body.Size.X * 1.1, 0.18, 0.5),
+				CFrame.new(0, -body.Size.Y * 0.3, -body.Size.Z * 0.5), GOLD)
+			piece("BootNozzle", body, Vector3.new(0.1, 0.5, 0.5),
+				CFrame.new(0, -body.Size.Y * 0.5 - 0.02, 0.1) * CFrame.Angles(0, 0, math.pi / 2), C.Cyan, NEON, CYL)
+			addThruster(body, i == 1 and C.Cyan or C.Gold)
+		end
+	end
+
+	-- helmet
+	if head then
+		local hx, hy, hz = head.Size.X, head.Size.Y, head.Size.Z
+		local H = { Head = true }
+		piece("Helmet", head, head.Size * 1.13, CFrame.new(0, 0.02, 0), RED, METAL, nil, H)
+		piece("HelmetCrest", head, Vector3.new(0.14, 0.22, hz * 0.95), CFrame.new(0, hy * 0.58, 0), GOLD, METAL, nil, H)
+		piece("Faceplate", head, Vector3.new(hx * 0.78, hy * 0.7, 0.1),
+			CFrame.new(0, -hy * 0.05, -hz * 0.6), GOLD, METAL, nil, H)
+		piece("FaceMouth", head, Vector3.new(hx * 0.3, 0.07, 0.06),
+			CFrame.new(0, -hy * 0.28, -hz * 0.66), DARK, METAL, nil, H)
+		piece("EyeL", head, Vector3.new(hx * 0.3, 0.1, 0.05),
+			CFrame.new(-hx * 0.2, hy * 0.08, -hz * 0.66) * CFrame.Angles(0, 0, 0.22), C.White, NEON, nil, H)
+		piece("EyeR", head, Vector3.new(hx * 0.3, 0.1, 0.05),
+			CFrame.new(hx * 0.2, hy * 0.08, -hz * 0.66) * CFrame.Angles(0, 0, -0.22), C.White, NEON, nil, H)
+		piece("EarL", head, Vector3.new(0.12, 0.55, 0.55),
+			CFrame.new(-hx * 0.58, 0, 0) * CFrame.Angles(0, 0, math.pi / 2), DARK, METAL, CYL, H)
+		piece("EarR", head, Vector3.new(0.12, 0.55, 0.55),
+			CFrame.new(hx * 0.58, 0, 0) * CFrame.Angles(0, 0, math.pi / 2), DARK, METAL, CYL, H)
+	end
+end
+
+-- called every frame while the suit is assembling
+local function stepDeploy()
+	if not S.Deploying then return end
+	local now = os.clock() - S.DeployStart
+	local pending = 0
+	for _, r in ipairs(Pieces) do
+		if not r.Done then
+			local p = r.Part
+			if not alive(p) or not alive(r.Body) then
+				r.Done = true
+			else
+				local t = (now - r.Delay) / r.Dur
+				if t >= 0 then
+					t = math.min(t, 1)
+					local e = 1 - (1 - t) ^ 3
+					local final = r.Body.CFrame * r.Offset
+					p.CFrame = r.Start:Lerp(final, e)
+					p.Transparency = 1 + (r.Final - 1) * math.min(t * 3, 1)
+					if t >= 1 then
+						p.CFrame = final
+						p.Anchored = false
+						p.Parent = Character
+						make("WeldConstraint", { Part0 = r.Body, Part1 = p }, p)
+						table.insert(Armor, p)
+						r.Done = true
+						if math.random() < 0.35 then
+							particlesAt(p.Position, C.Gold, 4, 9)
+						end
+						if os.clock() - S.LastClank > 0.11 then
+							S.LastClank = os.clock()
+							playSound(SND.Metal, { Volume = 0.35, Speed = rnd(0.7, 1.5) })
+						end
+					else
+						pending += 1
+					end
+				else
+					pending += 1
+				end
+			end
+		end
+	end
+	if pending == 0 then
+		S.Deploying = false
+		if S.Suit then
+			SuitHighlight = make("Highlight", {
+				Name = "JARVIS_EnergyAura", Adornee = Character,
+				FillColor = C.Cyan, OutlineColor = C.Gold,
+				FillTransparency = 0.93, OutlineTransparency = 0.15,
+				DepthMode = Enum.HighlightDepthMode.Occluded,
+			}, Character)
+			screenFlash(C.Cyan, 0.25, 0.7)
+			shockwave(Root.Position - Vector3.new(0, 2.8, 0), C.Cyan, 22, 0.7, 0.2)
+			glowBall(Root.Position, 7, C.White, 0.4)
+			playSound(SND.Boom, { Volume = 0.6, Speed = 1.1, Reverb = true })
+			local sweep = playSound(SND.Ping, { Volume = 0.8, Speed = 0.5, Life = 2 })
+			if sweep then tween(sweep, 0.5, { PlaybackSpeed = 2.4 }) end
+			S.FovKick = 14
+			addShake(0.5)
+			setStatus("MARK ∞ ONLINE // ALL SYSTEMS NOMINAL")
+		end
+	end
+end
+
+local function clearArmor(animated)
+	restorePose()
+	destroyLoops()
+
+	for _, r in ipairs(Pieces) do
+		if not r.Done and alive(r.Part) then r.Part:Destroy() end
+	end
+	table.clear(Pieces)
+
+	for _, p in ipairs(Armor) do
+		if alive(p) then
+			if animated then
+				local w = p:FindFirstChildOfClass("WeldConstraint")
+				if w then w:Destroy() end
+				local cf = p.CFrame
+				p.Anchored = true
+				p.Parent = VFX
+				for _, ch in ipairs(p:GetChildren()) do
+					if ch:IsA("PointLight") or ch:IsA("ParticleEmitter") or ch:IsA("Attachment") then ch:Destroy() end
+				end
+				tween(p, 0.7, {
+					CFrame = cf * CFrame.new(rnd(-1, 1) * 24, rnd(-0.2, 1) * 24, rnd(-1, 1) * 24)
+						* CFrame.Angles(rnd(0, 6), rnd(0, 6), rnd(0, 6)),
+					Transparency = 1,
+				}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+				Debris:AddItem(p, 0.9)
+			else
+				p:Destroy()
+			end
+		end
+	end
+	table.clear(Armor)
+
+	for _, t in ipairs(Thrusters) do
+		for _, a in ipairs(t.Attachments) do
+			if alive(a) then a:Destroy() end
+		end
+		if alive(t.Trail) then t.Trail:Destroy() end
+	end
+	table.clear(Thrusters)
+	Reactor, ReactorLight, ChargeOrb, ChargeLight, PalmEmitter = nil, nil, nil, nil, nil
+	if SuitHighlight then SuitHighlight:Destroy() SuitHighlight = nil end
+end
+
+--========================================================
+-- ENERGY
+--========================================================
+
+local function spend(cost)
+	if overdriveActive() then cost = cost * 0.5 end
+	if S.Energy < cost then
+		setStatus("INSUFFICIENT ENERGY")
+		playSound(SND.Click, { Volume = 0.6, Speed = 0.5 })
+		return false
+	end
+	S.Energy -= cost
+	return true
+end
+
+local function systemsReady()
+	if not S.Suit then return false end
+	if S.Deploying then
+		setStatus("SYSTEMS INITIALIZING")
+		return false
+	end
+	return true
+end
+
+--========================================================
+-- TARGETING
+--========================================================
+
+local function addCandidate(model)
+	if model == Character then return end
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+	if hum and root then
+		table.insert(S.Candidates, { Model = model, Humanoid = hum, Root = root })
+	end
+end
+
+local function refreshCandidates()
+	table.clear(S.Candidates)
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl ~= Player and pl.Character then addCandidate(pl.Character) end
+	end
+	for _, inst in ipairs(CollectionService:GetTagged(CFG.TargetTag)) do
+		if inst:IsA("Model") then addCandidate(inst) end
+	end
+	if CFG.ScanNPCs then
+		for _, inst in ipairs(workspace:GetDescendants()) do
+			if inst:IsA("Humanoid") and inst.Parent:IsA("Model")
+				and not Players:GetPlayerFromCharacter(inst.Parent)
+				and inst.Parent ~= Character then
+				addCandidate(inst.Parent)
+			end
+		end
+	end
+end
+
+-- sorted list of visible targets inside a view cone
+local function evaluateTargets(cone, maxCount)
+	local cam = workspace.CurrentCamera
+	local list = {}
+	if not cam then return list end
+	local params = rayParams()
+	for _, c in ipairs(S.Candidates) do
+		if alive(c.Root) and c.Humanoid.Health > 0 then
+			local rel = c.Root.Position - cam.CFrame.Position
+			local dist = rel.Magnitude
+			if dist > 5 and dist < CFG.LockRange then
+				local dot = cam.CFrame.LookVector:Dot(rel.Unit)
+				if dot > cone then
+					local hit = workspace:Raycast(cam.CFrame.Position, rel, params)
+					if not hit or hit.Instance:IsDescendantOf(c.Model) then
+						table.insert(list, { Root = c.Root, Humanoid = c.Humanoid, Name = c.Model.Name,
+							Dist = dist, Score = dist * (1 - dot) })
+					end
+				end
+			end
+		end
+	end
+	table.sort(list, function(a, b) return a.Score < b.Score end)
+	while #list > maxCount do table.remove(list) end
+	return list
+end
+
+local function scanTarget()
+	if os.clock() - S.LastCandidateRefresh > 2 then
+		S.LastCandidateRefresh = os.clock()
+		refreshCandidates()
+	end
+	local list = evaluateTargets(CFG.LockCone, 1)
+	local best = list[1]
+	if best and not S.Target then
+		playSound(SND.Ping, { Volume = 0.4, Speed = 2.2 })
+	end
+	S.Target = best and best.Root or nil
+	S.TargetInfo = best
+	Gui.Target.Text = best and ("TARGET: " .. best.Name) or "TARGET: NONE"
+end
+
+-- third-person safe aim ray (skips the stretch behind the character)
+local function aimPoint(range)
+	local cam = workspace.CurrentCamera
+	local look = cam.CFrame.LookVector
+	local skip = math.max(0, (Root.Position - cam.CFrame.Position):Dot(look))
+	local start = cam.CFrame.Position + look * skip
+	local result = workspace:Raycast(start, look * range, rayParams())
+	if result then return result.Position, result end
+	return start + look * range, nil
+end
+
+--========================================================
+-- REPULSOR
+--========================================================
+
+function startCharge()
+	if not systemsReady() or S.Charging or S.Busy then return end
+	if os.clock() - S.Last.Repulsor < CFG.RepulsorCooldown then return end
+	S.Charging = true
+	S.ChargeStart = os.clock()
+	setStatus("REPULSOR CHARGING...")
+end
+
+function fireRepulsor()
+	if not S.Suit or not S.Charging then return end
+	S.Charging = false
+	S.AimUntil = os.clock() + CFG.AimHold
+
+	local alpha = math.clamp((os.clock() - S.ChargeStart) / CFG.ChargeTime, 0.15, 1)
+	if not spend(CFG.RepulsorCost + 10 * alpha) then return end
+	S.Last.Repulsor = os.clock()
+
+	local hand = bodyPart("RightHand", "Right Arm")
+	local origin = hand and hand.CFrame:PointToWorldSpace(Vector3.new(0, -hand.Size.Y * 0.5 - 0.3, 0))
+		or (Root.Position + Vector3.new(0, 1, 0))
+
+	local destination, hit = aimPoint(200 + 260 * alpha)
+	local color = alpha >= 0.9 and C.Gold or C.Cyan
+	local dir = (destination - origin)
+	if dir.Magnitude < 1 then dir = Root.CFrame.LookVector end
+	dir = dir.Unit
+
+	-- layered beam, arcs, muzzle flash
+	beamBetween(origin, destination, color, 0.3 + alpha * 0.9, 0.25)
+	beamBetween(origin, destination, C.White, 0.1 + alpha * 0.3, 0.18)
+	for _ = 1, 2 + math.floor(alpha * 3) do
+		lightning(origin, destination, color, 0.08 + alpha * 0.12, 0.2, 10, 1.5 + alpha * 3)
+	end
+	glowBall(origin, 1.5 + alpha * 2, C.White, 0.2)
+	shockwave(origin + dir * 0.5, color, 3 + alpha * 3, 0.3, 0.12, dir)
+	impactAt(destination, hit and hit.Normal or Vector3.yAxis, color, 0.5 + alpha * 0.9,
+		hit and hit.Instance)
+	addShake(0.15 + alpha * 0.35)
+
+	playSound(SND.Shot, { Volume = 0.7, Speed = 2 - alpha * 0.7 })
+	playSound(SND.Lunge, { Volume = 0.5, Speed = 1.4 - alpha * 0.5 })
+	playSound(SND.Ping, { Volume = 0.5, Speed = 0.5 + alpha * 0.3 })
+
+	if hand then
+		local light = make("PointLight", { Color = color, Brightness = 8, Range = 16 }, hand)
+		Debris:AddItem(light, 0.18)
+	end
+	if S.Flying then
+		S.Vel -= workspace.CurrentCamera.CFrame.LookVector * (8 + alpha * 18)
+	end
+	S.FovKick = 5 + alpha * 6
+	setStatus(alpha >= 0.9 and "FULL-POWER REPULSOR DISCHARGED" or "REPULSOR DISCHARGED")
+end
+
+--========================================================
+-- MISSILES (multi-lock barrage)
+--========================================================
+
+local function launchMissile(origin, targetPart, fixedPoint, delay, spread)
+	task.delay(delay, function()
+		if not S.Suit or not Root then return end
+
+		local missile = make("Part", {
+			Name = "Missile", Size = Vector3.new(0.35, 0.35, 1.4),
+			CFrame = CFrame.new(origin),
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+			CastShadow = false, Material = Enum.Material.Neon, Color = C.Gold,
+		}, VFX)
+		make("PointLight", { Color = C.Gold, Brightness = 4, Range = 8 }, missile)
+		local a0 = make("Attachment", { Position = Vector3.new(0, 0.15, 0.6) }, missile)
+		local a1 = make("Attachment", { Position = Vector3.new(0, -0.15, 0.6) }, missile)
+		make("Trail", {
+			Attachment0 = a0, Attachment1 = a1, Lifetime = 0.5,
+			Color = ColorSequence.new(C.Gold, C.Cyan), LightEmission = 1,
+			Transparency = NumberSequence.new(0, 1),
+			WidthScale = NumberSequence.new(1, 0),
+		}, missile)
+		local s0 = make("Attachment", { Position = Vector3.new(0, 0.35, 0.6) }, missile)
+		local s1 = make("Attachment", { Position = Vector3.new(0, -0.35, 0.6) }, missile)
+		make("Trail", {
+			Attachment0 = s0, Attachment1 = s1, Lifetime = 1.1,
+			Color = ColorSequence.new(Color3.fromRGB(200, 200, 205)),
+			Transparency = NumberSequence.new(0.5, 1),
+			WidthScale = NumberSequence.new(1, 3),
+		}, missile)
+
+		playSound(SND.Shot, { Parent = missile, Volume = 0.45, Speed = 1.1 + math.random() * 0.3 })
+
+		local control = origin + Vector3.new(0, 14 + math.random() * 12, 0) + spread * 16
+		local startTime = os.clock()
+		local dest = (alive(targetPart) and targetPart.Position) or fixedPoint
+		local duration = math.clamp((dest - origin).Magnitude / CFG.MissileSpeed, 0.5, 1.9)
+		local conn
+
+		conn = RunService.RenderStepped:Connect(function()
+			if not alive(missile) then conn:Disconnect() return end
+			if alive(targetPart) then dest = targetPart.Position end
+
+			local t = math.clamp((os.clock() - startTime) / duration, 0, 1)
+			local function bez(x)
+				local u = 1 - x
+				return u * u * origin + 2 * u * x * control + x * x * dest
+			end
+			local pos, nextPos = bez(t), bez(math.min(t + 0.02, 1))
+			if (nextPos - pos).Magnitude > 0.001 then
+				missile.CFrame = CFrame.lookAt(pos, nextPos)
+			else
+				missile.CFrame = CFrame.new(pos)
+			end
+
+			if t >= 1 then
+				conn:Disconnect()
+				local ground = workspace:Raycast(dest + Vector3.new(0, 3, 0), Vector3.new(0, -8, 0), rayParams())
+				impactAt(dest, ground and ground.Normal or Vector3.yAxis, C.Gold, 1.1,
+					ground and ground.Instance)
+				missile:Destroy()
+			end
+		end)
+		Debris:AddItem(missile, 4)
+	end)
+end
+
+function fireMissiles()
+	if not systemsReady() or S.Busy then return end
+	if os.clock() - S.Last.Missile < CFG.MissileCooldown then
+		setStatus("MISSILES RELOADING")
+		playSound(SND.Click, { Volume = 0.6, Speed = 0.5 })
+		return
+	end
+	if not spend(CFG.MissileCost) then return end
+	S.Last.Missile = os.clock()
+	S.AimUntil = os.clock() + CFG.AimHold
+
+	local cam = workspace.CurrentCamera
+	local targets = evaluateTargets(CFG.MultiLockCone, 4)
+	local point = aimPoint(250)
+	local upper = bodyPart("UpperTorso", "Torso")
+	local base = upper and upper.CFrame or Root.CFrame
+
+	for i = 1, CFG.MissileCount do
+		local side = (i % 2 == 0) and 1 or -1
+		local origin = base:PointToWorldSpace(Vector3.new(side * 1.3, 1.1, 0.6))
+		local spread = (cam.CFrame.RightVector * side + Vector3.new(0, 0.6, 0)).Unit
+		local t = targets[((i - 1) % math.max(#targets, 1)) + 1]
+		local scatter = Vector3.new(rnd(-7, 7), rnd(-4, 4), rnd(-7, 7))
+		launchMissile(origin, t and t.Root or nil, point + scatter, (i - 1) * 0.08, spread)
+	end
+
+	playSound(SND.Click, { Volume = 0.6, Speed = 1.6 })
+	addShake(0.25)
+	setStatus(#targets > 0 and string.format("BARRAGE // %d TARGETS LOCKED", #targets) or "MISSILE BARRAGE // UNGUIDED")
+end
+
+--========================================================
+-- UNIBEAM
+--========================================================
+
+function startUnibeam()
+	if not systemsReady() or S.Unibeam or S.Busy then return end
+	if S.Energy < 12 then
+		setStatus("INSUFFICIENT ENERGY")
+		return
+	end
+	S.Unibeam = true
+	S.UniTick = 0
+	local function bp(color, size)
+		return make("Part", {
+			Name = "Unibeam", Size = Vector3.new(size, size, 1),
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+			CastShadow = false, Material = Enum.Material.Neon, Color = color,
+		}, VFX)
+	end
+	UniOuter = bp(C.Cyan, 1.6)
+	UniInner = bp(C.White, 0.7)
+	UniGlow = make("Part", {
+		Name = "UnibeamGlow", Shape = Enum.PartType.Ball, Size = Vector3.one * 2.4,
+		Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		CastShadow = false, Material = Enum.Material.Neon, Color = C.White, Transparency = 0.2,
+	}, VFX)
+	make("PointLight", { Color = C.Cyan, Brightness = 10, Range = 28 }, UniGlow)
+	S.LoopTarget.Beam = 0.7
+	playSound(SND.Boom, { Volume = 0.5, Speed = 1.6 })
+	setStatus("UNIBEAM ACTIVE")
+end
+
+function stopUnibeam()
+	if not S.Unibeam then return end
+	S.Unibeam = false
+	S.LoopTarget.Beam = 0
+	for _, p in ipairs({ UniOuter, UniInner, UniGlow }) do
+		if alive(p) then
+			tween(p, 0.25, { Transparency = 1 })
+			Debris:AddItem(p, 0.3)
+		end
+	end
+	UniOuter, UniInner, UniGlow = nil, nil, nil
+	playSound(SND.Ping, { Volume = 0.5, Speed = 0.6 })
+	setStatus("UNIBEAM OFFLINE")
+end
+
+local function updateUnibeam(dt)
+	if not (UniOuter and UniInner and UniGlow) then return end
+	local origin = Reactor and Reactor.Position or Root.Position
+	local dest, hit = aimPoint(280)
+	local len = (dest - origin).Magnitude
+	if len < 1 then return end
+	local mid = CFrame.lookAt((origin + dest) / 2, dest)
+	local pulse = 1 + math.sin(clock * 55) * 0.15
+	UniOuter.Size = Vector3.new(1.6 * pulse, 1.6 * pulse, len)
+	UniOuter.CFrame = mid
+	UniInner.Size = Vector3.new(0.7 * pulse, 0.7 * pulse, len)
+	UniInner.CFrame = mid
+	UniGlow.CFrame = CFrame.new(origin)
+	UniGlow.Size = Vector3.one * (2.4 * pulse)
+
+	S.Energy -= CFG.UnibeamDrain * (overdriveActive() and 0.4 or 1) * dt
+	addShake(0.012)
+
+	S.UniTick += dt
+	if S.UniTick > 0.09 then
+		S.UniTick = 0
+		particlesAt(dest, C.White, 10, 22)
+		lightning(origin, dest, C.Cyan, 0.12, 0.12, 9, 2.5)
+		if hit then
+			spawnDebris(dest + hit.Normal * 0.3, hit.Instance.Color, 2, 20)
+			if math.random() < 0.25 then
+				impactAt(dest, hit.Normal, C.Cyan, 0.6, hit.Instance, true)
+			end
+		end
+	end
+
+	if S.Energy <= 0 then
+		S.Energy = 0
+		stopUnibeam()
+	end
+end
+
+--========================================================
+-- SHIELD
+--========================================================
+
+function setShield(on)
+	if on == S.Shield then return end
+	if on then
+		if not systemsReady() then return end
+		if S.Energy < 10 then setStatus("INSUFFICIENT ENERGY") return end
+		S.Shield = true
+		ShieldPart = make("Part", {
+			Name = "JARVIS_Shield", Shape = Enum.PartType.Ball, Size = Vector3.one * 2,
+			Material = Enum.Material.ForceField, Color = C.Cyan, Transparency = 0.45,
+			CanCollide = false, CanTouch = false, CanQuery = false,
+			Massless = true, CastShadow = false,
+		}, Character)
+		ShieldPart.CFrame = Root.CFrame
+		make("WeldConstraint", { Part0 = Root, Part1 = ShieldPart }, ShieldPart)
+		tween(ShieldPart, 0.45, { Size = Vector3.one * CFG.ShieldRadius * 2 },
+			Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+		shockwave(Root.Position, C.Cyan, 9, 0.5, 0.15)
+		S.LoopTarget.Shield = 0.18
+		playSound(SND.Ping, { Volume = 0.6, Speed = 1.8 })
+		playSound(SND.Whoosh, { Volume = 0.4, Speed = 1.6 })
+		setStatus("SHIELD ONLINE")
+	else
+		S.Shield = false
+		S.LoopTarget.Shield = 0
+		if ShieldPart then
+			local sp = ShieldPart
+			ShieldPart = nil
+			tween(sp, 0.3, { Size = Vector3.one * 1, Transparency = 1 })
+			Debris:AddItem(sp, 0.4)
+		end
+		playSound(SND.Ping, { Volume = 0.5, Speed = 0.6 })
+		setStatus("SHIELD OFFLINE")
+	end
+end
+
+--========================================================
+-- ORBITAL STRIKE
+--========================================================
+
+function strike()
+	if not systemsReady() or S.Busy then return end
+	if os.clock() - S.Last.Strike < CFG.StrikeCooldown then
+		setStatus("ORBITAL STRIKE RECHARGING")
+		playSound(SND.Click, { Volume = 0.6, Speed = 0.5 })
+		return
+	end
+
+	local pos = aimPoint(450)
+	if alive(S.Target) then pos = S.Target.Position end
+	local g = workspace:Raycast(pos + Vector3.new(0, 60, 0), Vector3.new(0, -240, 0), rayParams())
+	local normal = Vector3.yAxis
+	if g then pos, normal = g.Position, g.Normal end
+
+	if not spend(CFG.StrikeCost) then return end
+	S.Last.Strike = os.clock()
+	S.AimUntil = os.clock() + 1
+	setStatus("ORBITAL STRIKE // TARGET PAINTED")
+
+	task.spawn(function()
+		local outer = disc(pos + normal * 0.15, normal, 28, 0.1, C.Warn, 0.6)
+		local inner = disc(pos + normal * 0.2, normal, 9, 0.1, C.Warn, 0.4)
+		tween(outer, 1.4, { Size = Vector3.new(0.1, 18, 18) }, Enum.EasingStyle.Linear)
+		for _, t in ipairs({ 0, 0.35, 0.65, 0.9, 1.08, 1.22, 1.32 }) do
+			task.delay(t, function()
+				playSound(SND.Ping, { Position = pos, Volume = 0.7, Speed = 1.8, Range = 300 })
+				if alive(inner) then
+					inner.Transparency = 0.1
+					tween(inner, 0.15, { Transparency = 0.5 })
+				end
+			end)
+		end
+		task.wait(1.4)
+		if alive(outer) then outer:Destroy() end
+		if alive(inner) then inner:Destroy() end
+
+		-- the beam from orbit
+		local beam = make("Part", {
+			Name = "StrikeBeam", Shape = Enum.PartType.Cylinder,
+			Size = Vector3.new(500, 8, 8),
+			CFrame = CFrame.new(pos + Vector3.new(0, 250, 0)) * CFrame.Angles(0, 0, math.pi / 2),
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+			CastShadow = false, Material = Enum.Material.Neon, Color = C.Cyan,
+		}, VFX)
+		local core = make("Part", {
+			Name = "StrikeCore", Shape = Enum.PartType.Cylinder,
+			Size = Vector3.new(500, 3.5, 3.5),
+			CFrame = beam.CFrame,
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+			CastShadow = false, Material = Enum.Material.Neon, Color = C.White,
+		}, VFX)
+		make("PointLight", { Color = C.Cyan, Brightness = 20, Range = 80 }, core)
+
+		impactAt(pos, normal, C.Cyan, 4.5, g and g.Instance)
+		explosion(pos, C.White, 3, true)
+		shockwave(pos + normal * 0.2, C.Cyan, 85, 1.2, 0.5, normal)
+		task.delay(0.15, function() shockwave(pos + normal * 0.2, C.Gold, 60, 1.0, 0.4, normal) end)
+		spawnDebris(pos + normal, Color3.fromRGB(110, 100, 90), 40, 70)
+		dustAt(pos, Color3.fromRGB(190, 180, 170), 30, 40)
+		for i = 1, 16 do
+			local a = i / 16 * math.pi * 2
+			lightning(pos, pos + Vector3.new(math.cos(a) * 40, rnd(2, 14), math.sin(a) * 40),
+				C.Cyan, 0.4, 0.6, 7, 6)
+		end
+		screenFlash(C.White, 0.6, 1.1)
+		addShake(1.2)
+		S.FovKick = 10
+		playSound(SND.Boom, { Position = pos, Volume = 1, Speed = 0.5, Range = 500, Reverb = true })
+		playSound(SND.Boom, { Position = pos, Volume = 0.8, Speed = 0.8, Range = 500 })
+		playSound(SND.Shot, { Position = pos, Volume = 0.8, Speed = 0.4, Range = 500 })
+
+		tween(beam, 0.9, { Size = Vector3.new(500, 0.2, 0.2), Transparency = 1 })
+		tween(core, 0.7, { Size = Vector3.new(500, 0.1, 0.1), Transparency = 1 })
+		Debris:AddItem(beam, 1.1)
+		Debris:AddItem(core, 1.1)
+	end)
+end
+
+--========================================================
+-- ARC OVERDRIVE
+--========================================================
+
+function overdrive()
+	if not systemsReady() or S.Busy then return end
+	if os.clock() - S.Last.Overdrive < CFG.OverdriveCooldown then
+		setStatus("OVERDRIVE COOLING DOWN")
+		playSound(SND.Click, { Volume = 0.6, Speed = 0.5 })
+		return
+	end
+	if not spend(CFG.OverdriveCost) then return end
+
+	S.Busy = true
+	S.Last.Overdrive = os.clock()
+	setStatus("WARNING // ARC OVERDRIVE ENGAGED")
+
+	local sweep = playSound(SND.Ping, { Volume = 0.8, Speed = 0.4, Life = 2 })
+	if sweep then tween(sweep, 0.3, { PlaybackSpeed = 2.4 }) end
+
+	glowBall(Root.Position, 5, C.White, 0.4)
+	screenFlash(C.Cyan, 0.35, 0.8)
+	addShake(1)
+	if ReactorLight then ReactorLight.Brightness = 14 ReactorLight.Range = 36 end
+
+	task.wait(0.3)
+	if not S.Suit or not Root then S.Busy = false return end
+	local center = Root.Position
+
+	playSound(SND.Boom, { Volume = 1, Speed = 0.55, Range = 300, Reverb = true })
+	playSound(SND.Metal, { Volume = 0.7, Speed = 0.5 })
+	shockwave(center, C.Cyan, 55, 1.0, 0.3)
+	task.delay(0.15, function() shockwave(center, C.Gold, 40, 0.9, 0.25) end)
+	explosion(center, C.Cyan, 2, true)
+
+	for i = 1, 28 do
+		local a = i / 28 * math.pi * 2
+		local dir = Vector3.new(math.cos(a), 0, math.sin(a))
+		local tip = center + dir * rnd(18, 40) + Vector3.new(0, rnd(-4, 14), 0)
+		lightning(center, tip, (i % 2 == 0) and C.Gold or C.Cyan, 0.25, 0.65, 6, 4)
+	end
+
+	S.OverdriveUntil = os.clock() + CFG.OverdriveDuration
+	S.Energy = math.min(CFG.MaxEnergy, S.Energy + 25)
+	S.FovKick = 12
+
+	task.wait(0.6)
+	S.Busy = false
+end
+
+--========================================================
+-- FLIGHT
+--========================================================
+
+local function stopFlight(reason)
+	if not S.Flying then return end
+	S.Flying = false
+	S.Boosting = false
+	S.BoostActive = false
+	S.LeanDeg = 0
+	S.SpeedAlpha = 0
+
+	for _, obj in ipairs({ FlightVelocity, FlightOrientation, FlightAttachment }) do
+		if obj then obj:Destroy() end
+	end
+	FlightVelocity, FlightOrientation, FlightAttachment = nil, nil, nil
+
+	for _, t in ipairs(Thrusters) do
+		t.Emitter.Enabled = false
+		t.Trail.Enabled = false
+	end
+	S.LoopTarget.Flight = 0
+
+	if Humanoid then
+		Humanoid.PlatformStand = false
+		Humanoid.AutoRotate = true
+		Humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+	end
+	S.Vel = Vector3.zero
+	playSound(SND.Whoosh, { Volume = 0.4, Speed = 0.7 })
+	setStatus(reason or "FLIGHT OFF")
+end
+
+local function startFlight()
+	if not S.Suit then
+		setStatus("FLIGHT LOCKED // DEPLOY SUIT")
+		playSound(SND.Click, { Volume = 0.6, Speed = 0.5 })
+		return
+	end
+	if not systemsReady() then return end
+	if S.Flying or not Root or not Humanoid then return end
+	if S.Energy < 5 then setStatus("INSUFFICIENT ENERGY") return end
+
+	S.Flying = true
+	S.Facing = false
+	Humanoid.AutoRotate = false
+	Humanoid.PlatformStand = true
+
+	FlightAttachment = make("Attachment", { Name = "JARVIS_FlightAttachment" }, Root)
+	FlightVelocity = make("LinearVelocity", {
+		Name = "JARVIS_FlightVelocity", Attachment0 = FlightAttachment,
+		RelativeTo = Enum.ActuatorRelativeTo.World,
+		VelocityConstraintMode = Enum.VelocityConstraintMode.Vector,
+		VectorVelocity = Vector3.zero, MaxForce = 1e6,
+	}, Root)
+	FlightOrientation = make("AlignOrientation", {
+		Name = "JARVIS_FlightOrientation", Attachment0 = FlightAttachment,
+		Mode = Enum.OrientationAlignmentMode.OneAttachment,
+		Responsiveness = 18, MaxTorque = 1e6,
+		CFrame = Root.CFrame.Rotation,
+	}, Root)
+
+	S.Vel = Vector3.new(0, 28, 0)
+	local feet = Root.Position - Vector3.new(0, 2.8, 0)
+	shockwave(feet, C.Cyan, 16, 0.5, 0.2)
+	particlesAt(feet, C.Cyan, 40, 22)
+	dustAt(feet, Color3.fromRGB(190, 185, 180), 8, 18)
+	for _, t in ipairs(Thrusters) do t.Emitter.Enabled = true end
+	playSound(SND.Whoosh, { Volume = 0.9, Speed = 1.3 })
+	playSound(SND.Boom, { Volume = 0.4, Speed = 1.5 })
+	addShake(0.3)
+	S.FovKick = 8
+	setStatus("FLIGHT ONLINE // THRUSTERS ACTIVE")
+end
+
+function toggleFlight()
+	if S.Flying then stopFlight("FLIGHT OFF") else startFlight() end
+end
+
+local function moveInput()
+	if Controls then
+		local ok, v = pcall(function() return Controls:GetMoveVector() end)
+		if ok and v then return -v.Z, v.X end
+	end
+	local f, r = 0, 0
+	if UIS:IsKeyDown(Enum.KeyCode.W) then f += 1 end
+	if UIS:IsKeyDown(Enum.KeyCode.S) then f -= 1 end
+	if UIS:IsKeyDown(Enum.KeyCode.D) then r += 1 end
+	if UIS:IsKeyDown(Enum.KeyCode.A) then r -= 1 end
+	return f, r
+end
+
+local function updateFlight(dt)
+	local cam = workspace.CurrentCamera
+	local look, right = cam.CFrame.LookVector, cam.CFrame.RightVector
+	local fwdIn, sideIn = moveInput()
+
+	local vert = 0
+	if UIS:IsKeyDown(Enum.KeyCode.Space) or S.TouchUp then vert += 1 end
+	if UIS:IsKeyDown(Enum.KeyCode.LeftControl) or S.TouchDown then vert -= 1 end
+
+	local dir = look * fwdIn + right * sideIn + Vector3.new(0, vert, 0)
+	if dir.Magnitude > 1 then dir = dir.Unit end
+
+	local speed = CFG.FlightSpeed
+	local boosting = S.Boosting and dir.Magnitude > 0.1
+	if boosting then
+		speed = CFG.BoostSpeed * (overdriveActive() and 1.25 or 1)
+	end
+
+	if boosting and not S.BoostActive then
+		playSound(SND.Boom, { Volume = 0.7, Speed = 0.6, Reverb = true })
+		shockwave(Root.Position, C.White, 20, 0.5, 0.15, look)
+		shockwave(Root.Position - look * 3, C.Cyan, 14, 0.6, 0.12, look)
+		addShake(0.4)
+		S.FovKick = 12
+	end
+	S.BoostActive = boosting
+
+	local target = dir * speed
+	if dir.Magnitude < 0.05 then
+		target = Vector3.new(0, math.sin(os.clock() * 2) * 1.5, 0)
+	end
+
+	S.Vel = S.Vel:Lerp(target, 1 - math.exp(-CFG.Accel * dt))
+	FlightVelocity.VectorVelocity = S.Vel
+
+	local flatLook = Vector3.new(look.X, 0, look.Z)
+	if flatLook.Magnitude < 0.01 then flatLook = Root.CFrame.LookVector * Vector3.new(1, 0, 1) end
+	local yaw = CFrame.lookAt(Vector3.zero, flatLook.Unit)
+	local speedAlpha = math.clamp(S.Vel.Magnitude / CFG.BoostSpeed, 0, 1)
+	local pitchSign = (look.Y > 0.5 and vert >= 0 and fwdIn > 0) and 0.5 or 1
+	local lean = math.rad(CFG.MaxLean) * speedAlpha * pitchSign * (fwdIn > 0.1 and 1 or 0.3)
+	local bank = -sideIn * CFG.BankAmount * speedAlpha
+	FlightOrientation.CFrame = yaw * CFrame.Angles(-lean, 0, bank)
+	S.LeanDeg = math.deg(lean)
+	S.SpeedAlpha = speedAlpha
+
+	local rate = 40 + speedAlpha * 120 + (boosting and 80 or 0)
+	for _, t in ipairs(Thrusters) do
+		t.Emitter.Rate = rate
+		t.Emitter.Speed = NumberRange.new(10 + speedAlpha * 25)
+		t.Trail.Enabled = boosting
+	end
+	S.LoopTarget.Flight = 0.25 + speedAlpha * 0.6 + (boosting and 0.2 or 0)
+	if Loops.Flight then
+		Loops.Flight.PlaybackSpeed = 0.8 + speedAlpha * 0.7 + (boosting and 0.2 or 0)
+	end
+
+	-- ground effect: low flight kicks up dust
+	if os.clock() - S.LastGroundFx > 0.12 then
+		S.LastGroundFx = os.clock()
+		local g = workspace:Raycast(Root.Position, Vector3.new(0, -16, 0), rayParams())
+		if g then
+			local close = 1 - (Root.Position.Y - g.Position.Y) / 16
+			dustAt(g.Position + Vector3.new(0, 0.5, 0), g.Instance.Color:Lerp(Color3.new(1, 1, 1), 0.4),
+				math.floor(2 + close * 5), 8 + close * 14)
+		end
+	end
+
+	-- landing assist
+	if S.Vel.Y < -4 then
+		local hit = workspace:Raycast(Root.Position, Vector3.new(0, -5.5, 0), rayParams())
+		if hit then
+			local impact = hit.Position
+			stopFlight("LANDING COMPLETE")
+			shockwave(impact + Vector3.new(0, 0.2, 0), C.Cyan, 14, 0.5, 0.2)
+			particlesAt(impact, C.White, 25, 14)
+			dustAt(impact, Color3.fromRGB(190, 185, 180), 14, 20)
+			spawnDebris(impact, hit.Instance.Color, 8, 18)
+			playSound(SND.Boom, { Position = impact, Volume = 0.5, Speed = 1.4 })
+			addShake(0.3)
+			return
+		end
+	end
+
+	local drain = CFG.FlightDrain + (boosting and CFG.BoostDrain or 0)
+	if overdriveActive() then drain *= 0.4 end
+	S.Energy -= drain * dt
+	if S.Energy <= 0 then
+		S.Energy = 0
+		playSound(SND.Ping, { Volume = 0.8, Speed = 0.4 })
+		stopFlight("ENERGY DEPLETED // FLIGHT OFFLINE")
+	end
+end
+
+--========================================================
+-- SUIT ON / OFF
+--========================================================
+
+local function suitUp()
+	if S.Suit or not Character or not Character.Parent then return end
+	S.Suit = true
+	S.Deploying = true
+	S.DeployStart = os.clock()
+
+	createArmor()
+	setupShoulders()
+	createLoops()
+
+	playSound(SND.Whoosh, { Volume = 0.9, Speed = 0.8 })
+	playSound(SND.Ping, { Volume = 0.6, Speed = 0.5 })
+	S.FovKick = 10
+	addShake(0.2)
+	setStatus("ARMOR ASSEMBLY IN PROGRESS")
+
+	local name = string.upper(Player.DisplayName)
+	bootLog({
+		"> J.A.R.V.I.S. // MARK ∞",
+		"> ARMOR LINK ............. SYNCING",
+		"> ARC REACTOR ............ 100%",
+		"> REPULSORS .............. ARMED",
+		"> FLIGHT SYSTEMS ......... READY",
+		"> WELCOME BACK, " .. name,
+	})
+end
+
+local function suitDown(reason, silent, instant)
+	stopFlight("FLIGHT OFF")
+	stopUnibeam()
+	setShield(false)
+	local wasOn = S.Suit
+	S.Suit = false
+	S.Deploying = false
+	S.Charging = false
+	S.Busy = false
+	S.Target, S.TargetInfo = nil, nil
+	S.OverdriveUntil = 0
+	S.AimUntil = 0
+	S.BootToken += 1
+	if Gui.Log then Gui.Log.Text = "" end
+	if S.Facing and Humanoid then Humanoid.AutoRotate = true end
+	S.Facing = false
+	if wasOn and not silent then
+		playSound(SND.Metal, { Volume = 0.7, Speed = 0.5 })
+		playSound(SND.Whoosh, { Volume = 0.7, Speed = 1.2 })
+	end
+	clearArmor(wasOn and not instant)
+	setStatus(reason or "SYSTEM STANDBY // ARMOR RETRACTED")
+end
+
+function suitToggle()
+	if S.Suit then suitDown() else suitUp() end
+end
+
+function emergency()
+	if S.Suit then
+		suitDown("EMERGENCY SHUTDOWN")
+		screenFlash(C.Warn, 0.15, 0.5)
+	end
+end
+
+--========================================================
+-- INPUT
+--========================================================
+
+connect(UIS.InputBegan, function(input, processed)
+	if processed then return end
+	local k = input.KeyCode
+	if k == Enum.KeyCode.J then suitToggle()
+	elseif k == Enum.KeyCode.F then toggleFlight()
+	elseif k == Enum.KeyCode.Q then startCharge()
+	elseif k == Enum.KeyCode.R then fireMissiles()
+	elseif k == Enum.KeyCode.E then task.spawn(overdrive)
+	elseif k == Enum.KeyCode.C then startUnibeam()
+	elseif k == Enum.KeyCode.G then setShield(not S.Shield)
+	elseif k == Enum.KeyCode.T then task.spawn(strike)
+	elseif k == Enum.KeyCode.V then S.Boosting = true
+	elseif k == Enum.KeyCode.H then S.HUD = not S.HUD applyHudVisibility()
+	elseif k == Enum.KeyCode.M then
+		S.Muted = not S.Muted
+		setStatus(S.Muted and "AUDIO MUTED" or "AUDIO ONLINE")
+	elseif k == Enum.KeyCode.X then emergency()
+	end
+end)
+
+connect(UIS.InputEnded, function(input)
+	local k = input.KeyCode
+	if k == Enum.KeyCode.Q and S.Charging then fireRepulsor()
+	elseif k == Enum.KeyCode.C then stopUnibeam()
+	elseif k == Enum.KeyCode.V then S.Boosting = false
+	end
+end)
+
+-- hide helmet in first person (after the camera script has run)
+RunService:BindToRenderStep("JarvisFirstPerson", Enum.RenderPriority.Camera.Value + 1, function()
+	if not S.Suit or not Character then return end
+	local head = Character:FindFirstChild("Head")
+	local cam = workspace.CurrentCamera
+	if not head or not cam then return end
+	local firstPerson = (cam.CFrame.Position - head.Position).Magnitude < 1.4
+	for _, p in ipairs(Armor) do
+		if alive(p) and p:GetAttribute("HeadGear") then
+			p.LocalTransparencyModifier = firstPerson and 1 or 0
+		end
+	end
+end)
+
+--========================================================
+-- HUD UPDATE
+--========================================================
+
+local function updateHud(dt, cam)
+	local eAlpha = S.Energy / CFG.MaxEnergy
+	Gui.Energy.Size = UDim2.fromScale(math.clamp(eAlpha, 0, 1), 1)
+	Gui.Energy.BackgroundColor3 = eAlpha < 0.2 and C.Warn or (overdriveActive() and C.Gold or C.Cyan)
+	Gui.EnergyText.Text = string.format("%d%%", math.floor(eAlpha * 100 + 0.5))
+
+	local hp = math.clamp(Humanoid.Health / math.max(Humanoid.MaxHealth, 1), 0, 1)
+	Gui.Integrity.Size = UDim2.fromScale(hp, 1)
+	Gui.Integrity.BackgroundColor3 = hp < 0.3 and C.Warn or Color3.fromRGB(90, 255, 140)
+
+	local function cd(name, last, total)
+		local a = math.clamp((os.clock() - last) / total, 0, 1)
+		Gui.Cooldowns[name].Size = UDim2.fromScale(a, 1)
+		Gui.Cooldowns[name].BackgroundColor3 = a >= 1 and C.Cyan or C.Gold
+	end
+	cd("REP", S.Last.Repulsor, CFG.RepulsorCooldown)
+	cd("MSL", S.Last.Missile, CFG.MissileCooldown)
+	cd("OVR", S.Last.Overdrive, CFG.OverdriveCooldown)
+	cd("STK", S.Last.Strike, CFG.StrikeCooldown)
+
+	local mods = {}
+	if S.Shield then table.insert(mods, "SHIELD") end
+	if S.Unibeam then table.insert(mods, "UNIBEAM") end
+	if overdriveActive() then table.insert(mods, "OVERDRIVE") end
+	if S.BoostActive then table.insert(mods, "BOOST") end
+	Gui.Modules.Text = #mods > 0 and ("ACTIVE: " .. table.concat(mods, " / ")) or ""
+
+	Gui.Telemetry.Text = string.format("SPD %3d   ALT %4d",
+		Root.AssemblyLinearVelocity.Magnitude, Root.Position.Y)
+
+	-- compass
+	local look = cam.CFrame.LookVector
+	local heading = math.deg(math.atan2(look.X, -look.Z)) % 360
+	Gui.Heading.Text = string.format("%03d", heading)
+	for _, t in ipairs(Gui.Ticks) do
+		local diff = ((t.Deg - heading + 540) % 360) - 180
+		if math.abs(diff) < 52 then
+			t.Label.Visible = true
+			t.Label.Position = UDim2.new(0.5, diff * 4.2, 0, 8)
+		else
+			t.Label.Visible = false
+		end
+	end
+
+	-- radar
+	Gui.RadarSweep.Rotation = (clock * 140) % 360
+	local flatF = Vector3.new(look.X, 0, look.Z)
+	if flatF.Magnitude > 0.01 then
+		flatF = flatF.Unit
+		local flatR = Vector3.new(-flatF.Z, 0, flatF.X)
+		local used = 0
+		for _, c in ipairs(S.Candidates) do
+			if alive(c.Root) and c.Humanoid.Health > 0 and used < #Gui.Blips then
+				local rel = c.Root.Position - Root.Position
+				local x, y = rel:Dot(flatR), rel:Dot(flatF)
+				local dist = math.sqrt(x * x + y * y)
+				if dist < 120 then
+					used += 1
+					local b = Gui.Blips[used]
+					b.Visible = true
+					b.Position = UDim2.new(0.5, x / 120 * 68, 0.5, -y / 120 * 68)
+					b.BackgroundColor3 = (c.Root == S.Target) and C.Gold or C.Warn
+				end
+			end
+		end
+		for i = used + 1, #Gui.Blips do Gui.Blips[i].Visible = false end
+	end
+
+	-- reticle + ring
+	local charging = S.Charging and S.Suit
+	local cAlpha = charging and math.clamp((os.clock() - S.ChargeStart) / CFG.ChargeTime, 0, 1) or 0
+	local locked = S.Target ~= nil
+	for _, p in ipairs(Gui.ReticleParts) do
+		p.BackgroundColor3 = locked and C.Warn or C.Cyan
+	end
+	Gui.Reticle.Rotation = locked and (clock * 90) % 360 or 0
+	local ringSize = 56 - cAlpha * 22
+	Gui.Ring.Size = UDim2.fromOffset(ringSize, ringSize)
+	Gui.RingStroke.Transparency = charging and (0.5 - cAlpha * 0.45) or 0.75
+	Gui.RingStroke.Color = cAlpha >= 1 and C.Gold or C.Cyan
+	Gui.Charge.Size = UDim2.fromScale(cAlpha, 1)
+
+	-- target brackets
+	local info = S.TargetInfo
+	if info and alive(info.Root) and S.HUD then
+		local v, onScreen = cam:WorldToViewportPoint(info.Root.Position)
+		if onScreen and v.Z > 0 then
+			local dist = (info.Root.Position - cam.CFrame.Position).Magnitude
+			local size = math.clamp(7000 / dist, 54, 160)
+			Gui.Brackets.Visible = true
+			Gui.Brackets.Position = UDim2.fromOffset(v.X, v.Y)
+			Gui.Brackets.Size = UDim2.fromOffset(size, size)
+			Gui.Brackets.Rotation = math.sin(clock * 3) * 4
+			local h = info.Humanoid
+			Gui.BracketText.Text = string.format("%s\n%dm  HP %d%%", info.Name, dist,
+				math.clamp(h.Health / math.max(h.MaxHealth, 1), 0, 1) * 100)
+		else
+			Gui.Brackets.Visible = false
+		end
+	else
+		Gui.Brackets.Visible = false
+	end
+
+	-- speed lines
+	local intensity = 0
+	if S.Flying then
+		intensity = math.clamp((S.Vel.Magnitude - CFG.FlightSpeed * 0.6) / (CFG.BoostSpeed - CFG.FlightSpeed * 0.6), 0, 1)
+	end
+	local vp = cam.ViewportSize
+	local maxR = math.max(vp.X, vp.Y) * 0.65
+	for _, l in ipairs(Gui.SpeedLines) do
+		if intensity < 0.05 then
+			l.Frame.BackgroundTransparency = 1
+		else
+			l.Phase = (l.Phase + dt * (0.6 + intensity * 1.6)) % 1
+			local r = maxR * (0.35 + l.Phase * 0.75)
+			local dirx, diry = math.cos(l.Angle), math.sin(l.Angle)
+			l.Frame.Position = UDim2.new(0.5, dirx * r, 0.5, diry * r)
+			l.Frame.Rotation = math.deg(l.Angle) + 90
+			l.Frame.Size = UDim2.fromOffset(2, 40 + intensity * 150)
+			l.Frame.BackgroundTransparency = 1 - intensity * 0.55 * (1 - math.abs(l.Phase - 0.5) * 1.4)
+		end
+	end
+end
+
+--========================================================
+-- MAIN LOOP
+--========================================================
+
+connect(RunService.RenderStepped, function(dt)
+	clock += dt
+	local cam = workspace.CurrentCamera
+	if not cam or not Character or not Character.Parent or not Humanoid or not Root then return end
+
+	if S.StatusText ~= "" and os.clock() - S.StatusTime > 2.5 and Gui.Status then
+		Gui.Status.Text = baseStatus()
+	end
+
+	stepDebris(dt)
+	stepDeploy()
+
+	-- energy
+	if S.Shield then
+		S.Energy -= CFG.ShieldDrain * (overdriveActive() and 0.4 or 1) * dt
+		if S.Energy <= 0 then
+			S.Energy = 0
+			setShield(false)
+		end
+	end
+	if not S.Flying and not S.Unibeam and not S.Shield then
+		local mult = (S.Suit and overdriveActive()) and 2.5 or 1
+		S.Energy = math.min(CFG.MaxEnergy, S.Energy + CFG.Regen * mult * dt)
+	end
+	S.Energy = math.clamp(S.Energy, 0, CFG.MaxEnergy)
+
+	updateHud(dt, cam)
+
+	local charging = S.Charging and S.Suit
+	local cAlpha = charging and math.clamp((os.clock() - S.ChargeStart) / CFG.ChargeTime, 0, 1) or 0
+	if ChargeOrb then
+		ChargeOrb.Transparency = charging and 0.1 or 1
+		ChargeOrb.Size = Vector3.one * (0.3 + cAlpha * 1.4)
+		ChargeOrb.Color = cAlpha >= 1 and C.Gold or C.Cyan
+	end
+	if ChargeLight then
+		ChargeLight.Brightness = charging and (3 + cAlpha * 8) or 0
+		ChargeLight.Color = cAlpha >= 1 and C.Gold or C.Cyan
+	end
+	if PalmEmitter then PalmEmitter.Enabled = charging end
+	S.LoopTarget.Charge = charging and (0.25 + cAlpha * 0.35) or 0
+	if Loops.Charge then Loops.Charge.PlaybackSpeed = 0.6 + cAlpha * 1.8 end
+	if charging and cAlpha >= 1 and not S.FullChargeNotified then
+		S.FullChargeNotified = true
+		setStatus("REPULSOR AT FULL CHARGE")
+		playSound(SND.Ping, { Volume = 0.7, Speed = 2.4 })
+		addShake(0.08)
+	elseif not charging then
+		S.FullChargeNotified = false
+	end
+
+	local targetFov = CFG.BaseFOV
+
+	if S.Suit then
+		if Reactor and ReactorLight then
+			local over = overdriveActive()
+			local pulse = 3 + math.sin(clock * (over and 9 or 4)) * 0.8
+			if not S.Busy then
+				ReactorLight.Brightness = (over and (pulse + 5) or pulse) + (S.Unibeam and 6 or 0)
+				ReactorLight.Range = over and 28 or 16
+			end
+			local col = (over or S.Unibeam or (charging and cAlpha >= 1)) and C.Gold or C.Cyan
+			Reactor.Color = col
+			ReactorLight.Color = col
+		end
+		if SuitHighlight then
+			SuitHighlight.OutlineTransparency = 0.12 + math.sin(clock * 3) * 0.06
+			SuitHighlight.OutlineColor = overdriveActive() and C.Cyan or C.Gold
+		end
+		if ShieldPart then
+			ShieldPart.Transparency = 0.5 + math.sin(clock * 5) * 0.12
+		end
+		S.LoopTarget.Hum = S.Deploying and 0 or (0.07 + (overdriveActive() and 0.1 or 0))
+		if Loops.Hum then Loops.Hum.PlaybackSpeed = overdriveActive() and 0.45 or 0.3 end
+
+		local eAlpha = S.Energy / CFG.MaxEnergy
+		if eAlpha < 0.2 and os.clock() - S.LastLowWarn > 1.6 then
+			S.LastLowWarn = os.clock()
+			playSound(SND.Ping, { Volume = 0.35, Speed = 0.9 })
+		end
+
+		if S.Unibeam then updateUnibeam(dt) end
+
+		if S.Flying and FlightVelocity and FlightOrientation then
+			updateFlight(dt)
+			targetFov = CFG.BaseFOV + (CFG.BoostFOV - CFG.BaseFOV)
+				* (S.BoostActive and 1 or math.clamp(S.Vel.Magnitude / CFG.BoostSpeed * 0.3, 0, 0.3))
+		end
+
+		-- face the reticle while aiming on the ground
+		local aiming = charging or S.Unibeam or os.clock() < S.AimUntil
+		if not S.Flying then
+			if aiming then
+				if not S.Facing then
+					S.Facing = true
+					Humanoid.AutoRotate = false
+				end
+				local look = cam.CFrame.LookVector
+				local flat = Vector3.new(look.X, 0, look.Z)
+				if flat.Magnitude > 0.01 then
+					local goal = CFrame.lookAt(Root.Position, Root.Position + flat)
+					Root.CFrame = Root.CFrame:Lerp(goal, math.clamp(dt * 14, 0, 1))
+				end
+			elseif S.Facing then
+				S.Facing = false
+				Humanoid.AutoRotate = true
+			end
+		end
+
+		-- arm poses
+		if not S.Deploying then
+			local pitch = math.deg(math.asin(math.clamp(cam.CFrame.LookVector.Y, -1, 1)))
+			local left, right = 0, 0
+			if S.Flying then
+				local base = 15 + 155 * S.SpeedAlpha
+				left, right = base, base
+			end
+			if S.Shield and not S.Flying then left = 18 right = 18 end
+			if aiming and not S.Unibeam then
+				right = 90 + pitch + (S.Flying and S.LeanDeg or 0)
+			end
+			applyPose(dt, left, right)
+		end
+
+		if os.clock() - S.LastScan > 0.1 then
+			S.LastScan = os.clock()
+			scanTarget()
+		end
+	end
+
+	updateLoops(dt)
+
+	-- camera: FOV (with decaying punch) and shake
+	S.FovKick = S.FovKick * math.max(0, 1 - dt * 5)
+	cam.FieldOfView += ((targetFov + S.FovKick) - cam.FieldOfView) * math.clamp(dt * 7, 0, 1)
+
+	if S.Shake > 0.002 then
+		Humanoid.CameraOffset = Vector3.new(
+			(math.random() - 0.5) * S.Shake, (math.random() - 0.5) * S.Shake, 0)
+		S.Shake = S.Shake * math.max(0, 1 - dt * 7)
+	elseif Humanoid.CameraOffset ~= Vector3.zero then
+		Humanoid.CameraOffset = Vector3.zero
+		S.Shake = 0
+	end
+end)
+
+--========================================================
+-- CHARACTER LIFECYCLE
+--========================================================
+
+local function onCharacter(char)
+	for _, c in ipairs(Janitor) do c:Disconnect() end
+	table.clear(Janitor)
+
+	if S.Flying then stopFlight() end
+	stopUnibeam()
+	if ShieldPart then ShieldPart:Destroy() ShieldPart = nil end
+	S.Shield = false
+	clearArmor(false)
+	S.Suit, S.Deploying, S.Flying, S.Charging, S.Busy, S.Boosting = false, false, false, false, false, false
+	S.BoostActive, S.Facing = false, false
+	S.Target, S.TargetInfo, S.OverdriveUntil, S.Vel = nil, nil, 0, Vector3.zero
+	S.Energy = CFG.MaxEnergy
+
+	bindCharacter(char)
+	jconnect(Humanoid.Died, function()
+		suitDown("PILOT DOWN // SYSTEMS OFFLINE", true, true)
+	end)
+	setStatus("SYSTEM STANDBY // NEW PILOT BODY DETECTED")
+end
+
+connect(Player.CharacterAdded, onCharacter)
+jconnect(Humanoid.Died, function()
+	suitDown("PILOT DOWN // SYSTEMS OFFLINE", true, true)
+end)
+
+script.Destroying:Connect(function()
+	for _, c in ipairs(Connections) do c:Disconnect() end
+	for _, c in ipairs(Janitor) do c:Disconnect() end
+	pcall(function() RunService:UnbindFromRenderStep("JarvisFirstPerson") end)
+	stopFlight()
+	stopUnibeam()
+	clearArmor(false)
+	if Gui.Root then Gui.Root:Destroy() end
+	VFX:Destroy()
+end)
+
+applyHudVisibility()
+setStatus("J.A.R.V.I.S. READY // AWAITING DEPLOYMENT")
+print("[JARVIS MARK INFINITY v4] Initialized.")
