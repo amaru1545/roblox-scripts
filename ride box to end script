@@ -1,0 +1,934 @@
+
+--// TUFF ASS SCRIPT
+--// BADASS SKIDS EDITION
+--// LocalScript -> StarterPlayer -> StarterPlayerScripts
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+--==================================================
+-- CONFIG
+--==================================================
+
+local GUI_NAME = "TuffAssScriptGUI"
+
+local FORMATION_PART_NAME = "Touch"
+local POINT_PART_NAME = "Point"
+
+local FORMATION_SPEED = 2.2
+local FORMATION_RADIUS = 5
+local FORMATION_HEIGHT = 2.5
+
+local POINT_BRING_SPEED = 0.16
+local POINT_OFFSET = Vector3.new(0, 2.5, 0)
+local MAX_POINTS_PER_SCAN = 250
+
+local TRAIL_LIFETIME = 0.4
+
+local SYMBOLS = {"§", "$", "%", "&", "/", "✧", "⋆", "♡"}
+local SYMBOL_COUNT = 16
+local SYMBOL_RADIUS = 48
+local SYMBOL_GLOW_DISTANCE = 270
+
+local CYAN = Color3.fromRGB(0, 235, 255)
+local DARK = Color3.fromRGB(14, 16, 25)
+local WHITE = Color3.fromRGB(240, 250, 255)
+
+--==================================================
+-- CLEANUP PREVIOUS GUI
+--==================================================
+
+for _, name in ipairs({
+    GUI_NAME,
+    "TuffKittyEffects",
+    "TuffKittyCursor",
+}) do
+    local old = playerGui:FindFirstChild(name)
+    if old then
+        old:Destroy()
+    end
+end
+
+--==================================================
+-- STATE
+--==================================================
+
+local alive = true
+local formationEnabled = false
+local pointBringerEnabled = false
+
+local phase = 0
+local refreshClock = 0
+local symbolClock = 0
+local currentGlow = 0
+
+local originalState = {}
+local trails = {}
+
+local formationParts = {}
+local pointParts = {}
+
+local character
+local humanoidRootPart
+
+local connections = {}
+
+--==================================================
+-- CHARACTER
+--==================================================
+
+local function updateCharacter()
+    character = player.Character
+    humanoidRootPart = character
+        and character:FindFirstChild("HumanoidRootPart")
+end
+
+updateCharacter()
+
+connections[#connections + 1] =
+    player.CharacterAdded:Connect(function()
+        task.wait(0.5)
+        if alive then
+            updateCharacter()
+        end
+    end)
+
+--==================================================
+-- PART STATE
+--==================================================
+
+local function rememberPart(part)
+    if not part:IsA("BasePart") or originalState[part] then
+        return
+    end
+
+    originalState[part] = {
+        CFrame = part.CFrame,
+        Anchored = part.Anchored,
+        CanCollide = part.CanCollide,
+        CanTouch = part.CanTouch,
+        CanQuery = part.CanQuery,
+    }
+end
+
+local function restorePart(part)
+    local state = originalState[part]
+    if not state then
+        return
+    end
+
+    if part.Parent then
+        pcall(function()
+            part.CFrame = state.CFrame
+            part.Anchored = state.Anchored
+            part.CanCollide = state.CanCollide
+            part.CanTouch = state.CanTouch
+            part.CanQuery = state.CanQuery
+        end)
+    end
+
+    originalState[part] = nil
+end
+
+local function restoreAll()
+    for part in pairs(originalState) do
+        restorePart(part)
+    end
+end
+
+--==================================================
+-- FLYING TRAILS
+--==================================================
+
+local function createTrail(part)
+    if trails[part] or not part.Parent then
+        return
+    end
+
+    local a0 = Instance.new("Attachment")
+    a0.Name = "TuffTrailA"
+    a0.Position = Vector3.new(0, part.Size.Y * 0.35, 0)
+    a0.Parent = part
+
+    local a1 = Instance.new("Attachment")
+    a1.Name = "TuffTrailB"
+    a1.Position = Vector3.new(0, -part.Size.Y * 0.35, 0)
+    a1.Parent = part
+
+    local trail = Instance.new("Trail")
+    trail.Name = "TuffFlyingTrail"
+    trail.Attachment0 = a0
+    trail.Attachment1 = a1
+    trail.Lifetime = TRAIL_LIFETIME
+    trail.MinLength = 0.05
+    trail.FaceCamera = true
+    trail.LightEmission = 1
+
+    trail.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, CYAN),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(140, 80, 255)),
+    })
+
+    trail.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.1),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+
+    trail.Parent = part
+
+    trails[part] = {
+        trail = trail,
+        a0 = a0,
+        a1 = a1,
+    }
+end
+
+local function removeTrail(part)
+    local data = trails[part]
+    if not data then
+        return
+    end
+
+    for _, object in pairs(data) do
+        if object then
+            object:Destroy()
+        end
+    end
+
+    trails[part] = nil
+end
+
+local function removeAllTrails()
+    for part in pairs(trails) do
+        removeTrail(part)
+    end
+end
+
+--==================================================
+-- FIND PARTS BY NAME
+--==================================================
+
+local function getNamedParts(partName)
+    local result = {}
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart")
+            and obj.Name == partName
+            and not (character and obj:IsDescendantOf(character)) then
+
+            result[#result + 1] = obj
+        end
+    end
+
+    return result
+end
+
+--==================================================
+-- GUI
+--==================================================
+
+local gui = Instance.new("ScreenGui")
+gui.Name = GUI_NAME
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = false
+gui.DisplayOrder = 10
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = playerGui
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(290, 247)
+main.Position = UDim2.new(0, 25, 0.35, 0)
+main.BackgroundColor3 = DARK
+main.BorderSizePixel = 0
+main.Active = true
+main.Parent = gui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 14)
+mainCorner.Parent = main
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = CYAN
+mainStroke.Thickness = 1.5
+mainStroke.Transparency = 0.2
+mainStroke.Parent = main
+
+local gradient = Instance.new("UIGradient")
+gradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(20, 26, 42)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(10, 11, 19)),
+})
+gradient.Rotation = 35
+gradient.Parent = main
+
+local title = Instance.new("TextLabel")
+title.Name = "Title"
+title.Size = UDim2.new(1, -50, 0, 39)
+title.Position = UDim2.fromOffset(13, 2)
+title.BackgroundTransparency = 1
+title.Text = "✧ TUFF ASS SCRIPT"
+title.TextColor3 = CYAN
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.ZIndex = 3
+title.Parent = main
+
+local subtitle = Instance.new("TextLabel")
+subtitle.Name = "Subtitle"
+subtitle.Size = UDim2.new(1, -24, 0, 18)
+subtitle.Position = UDim2.fromOffset(13, 35)
+subtitle.BackgroundTransparency = 1
+subtitle.Text = "B A D A S S   S K I D S"
+subtitle.TextColor3 = Color3.fromRGB(145, 160, 185)
+subtitle.Font = Enum.Font.Code
+subtitle.TextSize = 9
+subtitle.TextXAlignment = Enum.TextXAlignment.Left
+subtitle.ZIndex = 3
+subtitle.Parent = main
+
+local closeButton = Instance.new("TextButton")
+closeButton.Size = UDim2.fromOffset(29, 28)
+closeButton.Position = UDim2.new(1, -37, 0, 7)
+closeButton.BackgroundColor3 = Color3.fromRGB(48, 25, 43)
+closeButton.Text = "×"
+closeButton.TextColor3 = Color3.fromRGB(255, 120, 190)
+closeButton.Font = Enum.Font.GothamBold
+closeButton.TextSize = 22
+closeButton.AutoButtonColor = false
+closeButton.ZIndex = 4
+closeButton.Parent = main
+
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 8)
+closeCorner.Parent = closeButton
+
+local function makeButton(text, y, accent)
+    local button = Instance.new("TextButton")
+    button.Size = UDim2.new(1, -26, 0, 39)
+    button.Position = UDim2.fromOffset(13, y)
+    button.BackgroundColor3 = Color3.fromRGB(36, 40, 56)
+    button.BorderSizePixel = 0
+    button.Text = text
+    button.TextColor3 = WHITE
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 12
+    button.AutoButtonColor = false
+    button.ZIndex = 3
+    button.Parent = main
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 9)
+    corner.Parent = button
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = accent
+    stroke.Transparency = 0.68
+    stroke.Thickness = 1
+    stroke.Parent = button
+
+    button.MouseEnter:Connect(function()
+        if alive then
+            TweenService:Create(button, TweenInfo.new(0.18), {
+                BackgroundColor3 = Color3.fromRGB(44, 53, 73),
+            }):Play()
+        end
+    end)
+
+    button.MouseLeave:Connect(function()
+        if alive then
+            local active = button:GetAttribute("Active") == true
+
+            TweenService:Create(button, TweenInfo.new(0.18), {
+                BackgroundColor3 = active
+                    and Color3.fromRGB(0, 83, 105)
+                    or Color3.fromRGB(36, 40, 56),
+            }):Play()
+        end
+    end)
+
+    return button
+end
+
+local formationButton = makeButton(
+    "✧  BRING FLY PATHS: OFF",
+    62,
+    CYAN
+)
+
+local pointButton = makeButton(
+    "♡  POINT BRINGER: OFF",
+    108,
+    Color3.fromRGB(110, 255, 170)
+)
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -26, 0, 37)
+status.Position = UDim2.fromOffset(13, 161)
+status.BackgroundColor3 = Color3.fromRGB(9, 13, 23)
+status.BackgroundTransparency = 0.12
+status.BorderSizePixel = 0
+status.Text = "●  READY  //  SYSTEMS IDLE"
+status.TextColor3 = Color3.fromRGB(160, 175, 195)
+status.Font = Enum.Font.Code
+status.TextSize = 10
+status.TextWrapped = true
+status.ZIndex = 3
+status.Parent = main
+
+local statusCorner = Instance.new("UICorner")
+statusCorner.CornerRadius = UDim.new(0, 8)
+statusCorner.Parent = status
+
+local footer = Instance.new("TextLabel")
+footer.Size = UDim2.new(1, -24, 0, 17)
+footer.Position = UDim2.new(0, 12, 1, -19)
+footer.BackgroundTransparency = 1
+footer.Text = "§  FOLLOW THE LIGHT  /  STAY TUFF  §"
+footer.TextColor3 = Color3.fromRGB(90, 125, 155)
+footer.Font = Enum.Font.Code
+footer.TextSize = 9
+footer.ZIndex = 3
+footer.Parent = main
+
+--==================================================
+-- REOPEN BUTTON
+--==================================================
+
+local reopen = Instance.new("TextButton")
+reopen.Size = UDim2.fromOffset(137, 37)
+reopen.Position = UDim2.new(0, 25, 0.35, 0)
+reopen.BackgroundColor3 = DARK
+reopen.Text = "✧  OPEN TUFF GUI"
+reopen.TextColor3 = CYAN
+reopen.Font = Enum.Font.GothamBold
+reopen.TextSize = 11
+reopen.Visible = false
+reopen.Active = true
+reopen.Parent = gui
+
+local reopenCorner = Instance.new("UICorner")
+reopenCorner.CornerRadius = UDim.new(0, 10)
+reopenCorner.Parent = reopen
+
+local reopenStroke = Instance.new("UIStroke")
+reopenStroke.Color = CYAN
+reopenStroke.Thickness = 1.3
+reopenStroke.Parent = reopen
+
+--==================================================
+-- DRAGGABLE GUI
+--==================================================
+
+local function makeDraggable(frame, handle)
+    local dragging = false
+    local dragStart
+    local startPosition
+
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+
+        dragging = true
+        dragStart = input.Position
+        startPosition = frame.Position
+
+        local endConnection
+        endConnection = input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+                if endConnection then
+                    endConnection:Disconnect()
+                end
+            end
+        end)
+    end)
+
+    connections[#connections + 1] =
+        UserInputService.InputChanged:Connect(function(input)
+            if not dragging then
+                return
+            end
+
+            if input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch then
+
+                local delta = input.Position - dragStart
+
+                frame.Position = UDim2.new(
+                    startPosition.X.Scale,
+                    startPosition.X.Offset + delta.X,
+                    startPosition.Y.Scale,
+                    startPosition.Y.Offset + delta.Y
+                )
+            end
+        end)
+end
+
+makeDraggable(main, title)
+makeDraggable(reopen, reopen)
+
+closeButton.MouseButton1Click:Connect(function()
+    main.Visible = false
+    reopen.Visible = true
+end)
+
+reopen.MouseButton1Click:Connect(function()
+    main.Visible = true
+    reopen.Visible = false
+end)
+
+--==================================================
+-- UPDATE BUTTONS
+--==================================================
+
+local function updateButtons()
+    formationButton.Text = formationEnabled
+        and "✧  BRING FLY PATHS: ON"
+        or "✧  BRING FLY PATHS: OFF"
+
+    pointButton.Text = pointBringerEnabled
+        and "♡  POINT BRINGER: ON"
+        or "♡  POINT BRINGER: OFF"
+
+    formationButton:SetAttribute("Active", formationEnabled)
+    pointButton:SetAttribute("Active", pointBringerEnabled)
+
+    formationButton.BackgroundColor3 = formationEnabled
+        and Color3.fromRGB(0, 83, 105)
+        or Color3.fromRGB(36, 40, 56)
+
+    pointButton.BackgroundColor3 = pointBringerEnabled
+        and Color3.fromRGB(30, 88, 60)
+        or Color3.fromRGB(36, 40, 56)
+
+    if formationEnabled and pointBringerEnabled then
+        status.Text = "●  BOTH SYSTEMS ACTIVE"
+        status.TextColor3 = CYAN
+    elseif formationEnabled then
+        status.Text = "●  FLY PATHS ACTIVE"
+        status.TextColor3 = CYAN
+    elseif pointBringerEnabled then
+        status.Text = "●  POINT BRINGER ACTIVE"
+        status.TextColor3 = Color3.fromRGB(110, 255, 170)
+    else
+        status.Text = "●  READY  //  SYSTEMS IDLE"
+        status.TextColor3 = Color3.fromRGB(160, 175, 195)
+    end
+end
+
+--==================================================
+-- BRING FLY PATHS
+--==================================================
+
+local function refreshFormationParts()
+    local found = getNamedParts(FORMATION_PART_NAME)
+    local newList = {}
+
+    for _, part in ipairs(found) do
+        if part.Parent then
+            newList[#newList + 1] = part
+
+            rememberPart(part)
+
+            pcall(function()
+                part.CanCollide = false
+            end)
+
+            createTrail(part)
+        end
+    end
+
+    for _, part in ipairs(formationParts) do
+        if not table.find(newList, part) then
+            removeTrail(part)
+            restorePart(part)
+        end
+    end
+
+    formationParts = newList
+end
+
+local function formationTarget(index, total, t)
+    if not humanoidRootPart then
+        return nil
+    end
+
+    local root = humanoidRootPart
+
+    local angle = t * FORMATION_SPEED
+        + (index / math.max(total, 1)) * math.pi * 2
+
+    local radius = FORMATION_RADIUS
+        + math.sin(t * 1.7 + index) * 1.1
+
+    local orbit = Vector3.new(
+        math.cos(angle) * radius,
+        FORMATION_HEIGHT + math.sin(t * 2 + index * 0.7) * 1.3,
+        math.sin(angle) * radius
+    )
+
+    local side = (index - 1) % 3
+    local row = math.floor((index - 1) / 3)
+
+    local rowOffset = Vector3.new(
+        (side - 1) * 1.5,
+        -row * 0.8,
+        0
+    )
+
+    local worldOffset = root.CFrame:VectorToWorldSpace(
+        orbit + rowOffset
+    )
+
+    local position = root.Position + worldOffset
+
+    local swoop = (math.sin(t * 2.1 + index * 1.4) + 1) / 2
+
+    local nearOffset = root.CFrame:VectorToWorldSpace(Vector3.new(
+        math.cos(angle) * 0.7,
+        0.2 + math.sin(t * 3 + index) * 0.5,
+        math.sin(angle) * 0.7
+    ))
+
+    position = position:Lerp(
+        root.Position + nearOffset,
+        swoop * 0.82
+    )
+
+    local minimumHeight = root.Position.Y - 1.2
+
+    position = Vector3.new(
+        position.X,
+        math.max(position.Y, minimumHeight),
+        position.Z
+    )
+
+    return CFrame.lookAt(
+        position,
+        root.Position + root.CFrame.LookVector * 2
+    )
+end
+
+--==================================================
+-- POINT BRINGER
+--==================================================
+
+local function refreshPoints()
+    local found = getNamedParts(POINT_PART_NAME)
+    local limited = {}
+
+    for i = 1, math.min(#found, MAX_POINTS_PER_SCAN) do
+        local part = found[i]
+        limited[#limited + 1] = part
+        rememberPart(part)
+    end
+
+    for _, part in ipairs(pointParts) do
+        if not table.find(limited, part) then
+            restorePart(part)
+        end
+    end
+
+    pointParts = limited
+end
+
+local function pointTarget(index)
+    if not humanoidRootPart then
+        return nil
+    end
+
+    local angle = phase * 2.5 + index * 0.45
+    local radius = 2 + (index % 4) * 0.65
+
+    local offset = Vector3.new(
+        math.cos(angle) * radius,
+        POINT_OFFSET.Y + math.sin(angle * 1.4) * 1.2,
+        math.sin(angle) * radius
+    )
+
+    return humanoidRootPart.CFrame * CFrame.new(offset)
+end
+
+--==================================================
+-- TOGGLE HANDLERS
+--==================================================
+
+formationButton.MouseButton1Click:Connect(function()
+    formationEnabled = not formationEnabled
+
+    if formationEnabled then
+        refreshFormationParts()
+    else
+        for _, part in ipairs(formationParts) do
+            removeTrail(part)
+            restorePart(part)
+        end
+
+        formationParts = {}
+    end
+
+    updateButtons()
+end)
+
+pointButton.MouseButton1Click:Connect(function()
+    pointBringerEnabled = not pointBringerEnabled
+
+    if pointBringerEnabled then
+        refreshPoints()
+    else
+        for _, part in ipairs(pointParts) do
+            restorePart(part)
+        end
+
+        pointParts = {}
+    end
+
+    updateButtons()
+end)
+
+--==================================================
+-- FULL CIRCLE SYMBOL EFFECT
+--==================================================
+
+local effectsGui = Instance.new("ScreenGui")
+effectsGui.Name = "TuffKittyEffects"
+effectsGui.ResetOnSpawn = false
+effectsGui.IgnoreGuiInset = true
+effectsGui.DisplayOrder = 5
+effectsGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+effectsGui.Parent = playerGui
+
+local symbolLabels = {}
+
+for i = 1, SYMBOL_COUNT do
+    local label = Instance.new("TextLabel")
+    label.Name = "MouseSymbol" .. i
+    label.AnchorPoint = Vector2.new(0.5, 0.5)
+    label.Size = UDim2.fromOffset(24, 24)
+    label.BackgroundTransparency = 1
+    label.Text = SYMBOLS[(i - 1) % #SYMBOLS + 1]
+    label.TextColor3 = CYAN
+    label.TextTransparency = 1
+    label.Font = Enum.Font.Code
+    label.TextSize = 16
+    label.ZIndex = 2
+    label.Parent = effectsGui
+
+    symbolLabels[i] = label
+end
+
+local function distanceToGui(mousePosition)
+    if not main.Visible then
+        return math.huge
+    end
+
+    local pos = main.AbsolutePosition
+    local size = main.AbsoluteSize
+
+    local nearestX = math.clamp(
+        mousePosition.X,
+        pos.X,
+        pos.X + size.X
+    )
+
+    local nearestY = math.clamp(
+        mousePosition.Y,
+        pos.Y,
+        pos.Y + size.Y
+    )
+
+    return (
+        mousePosition - Vector2.new(nearestX, nearestY)
+    ).Magnitude
+end
+
+local function updateSymbolCircle(dt)
+    symbolClock += dt
+
+    local mousePosition = UserInputService:GetMouseLocation()
+    local distance = distanceToGui(mousePosition)
+
+    local targetGlow = math.clamp(
+        1 - distance / SYMBOL_GLOW_DISTANCE,
+        0,
+        1
+    )
+
+    currentGlow += (targetGlow - currentGlow)
+        * math.clamp(dt * 3.5, 0, 1)
+
+    for i, label in ipairs(symbolLabels) do
+        -- Every symbol gets its own angle around the full circle.
+        local angle = (i - 1) / SYMBOL_COUNT * math.pi * 2
+            + symbolClock * 0.8
+
+        local radius = SYMBOL_RADIUS
+            + math.sin(symbolClock * 1.5 + i) * 3
+
+        label.Position = UDim2.fromOffset(
+            mousePosition.X + math.cos(angle) * radius,
+            mousePosition.Y + math.sin(angle) * radius
+        )
+
+        local glow = math.clamp(
+            currentGlow * (
+                0.78 + 0.22 * math.sin(symbolClock * 2 + i)
+            ),
+            0,
+            1
+        )
+
+        label.TextTransparency = 1 - glow * 0.85
+        label.TextSize = 13 + math.floor(glow * 5)
+        label.Rotation = math.deg(angle) % 360
+
+        label.Text = SYMBOLS[
+            (math.floor(symbolClock * 2 + i) - 1)
+                % #SYMBOLS + 1
+        ]
+    end
+end
+
+--==================================================
+-- MAIN ANIMATION
+--==================================================
+
+connections[#connections + 1] =
+    RunService.RenderStepped:Connect(function(dt)
+        if not alive then
+            return
+        end
+
+        phase += dt
+
+        updateSymbolCircle(dt)
+
+        local pulse = 0.12
+            + (math.sin(phase * 1.5) + 1) * 0.06
+
+        mainStroke.Transparency = 0.25 - pulse
+        mainStroke.Thickness = 1.3 + pulse * 3
+    end)
+
+--==================================================
+-- PART MOVEMENT LOOP
+--==================================================
+
+connections[#connections + 1] =
+    RunService.Heartbeat:Connect(function(dt)
+        if not alive then
+            return
+        end
+
+        refreshClock += dt
+
+        if not humanoidRootPart or not humanoidRootPart.Parent then
+            updateCharacter()
+            return
+        end
+
+        if refreshClock >= 1 then
+            refreshClock = 0
+
+            if formationEnabled then
+                refreshFormationParts()
+            end
+
+            if pointBringerEnabled then
+                refreshPoints()
+            end
+        end
+
+        if formationEnabled then
+            local total = #formationParts
+
+            for index, part in ipairs(formationParts) do
+                if part.Parent then
+                    local target = formationTarget(
+                        index,
+                        total,
+                        phase
+                    )
+
+                    if target then
+                        local alpha = math.clamp(dt * 5.5, 0, 1)
+
+                        pcall(function()
+                            part.CFrame = part.CFrame:Lerp(
+                                target,
+                                alpha
+                            )
+                        end)
+                    end
+                end
+            end
+        end
+
+        if pointBringerEnabled then
+            for index, part in ipairs(pointParts) do
+                if part.Parent then
+                    local target = pointTarget(index)
+
+                    if target then
+                        local alpha = math.clamp(
+                            dt / POINT_BRING_SPEED,
+                            0,
+                            1
+                        )
+
+                        pcall(function()
+                            part.CFrame = part.CFrame:Lerp(
+                                target,
+                                alpha
+                            )
+
+                            part.CanCollide = false
+                        end)
+                    end
+                end
+            end
+        end
+    end)
+
+--==================================================
+-- CLEANUP
+--==================================================
+
+local function cleanup()
+    if not alive then
+        return
+    end
+
+    alive = false
+
+    formationEnabled = false
+    pointBringerEnabled = false
+
+    for _, connection in ipairs(connections) do
+        connection:Disconnect()
+    end
+
+    removeAllTrails()
+    restoreAll()
+
+    if gui.Parent then
+        gui:Destroy()
+    end
+
+    if effectsGui.Parent then
+        effectsGui:Destroy()
+    end
+end
+
+script.Destroying:Connect(cleanup)
+
+updateButtons()
